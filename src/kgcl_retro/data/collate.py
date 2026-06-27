@@ -1,8 +1,50 @@
+from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any, List, Tuple  # Explanation: imports selected names needed to collate molecular graphs and edit labels into tensors
 import numpy as np  # Explanation: imports numpy as np for collate molecular graphs and edit labels into tensors
 import torch  # Explanation: imports torch for collate molecular graphs and edit labels into tensors
 from kgcl_retro.chemistry.features import ATOM_FDIM, BOND_FDIM  # Explanation: imports packaged atom and bond feature dimensions for label tensor sizing.
 from kgcl_retro.chemistry.graphs import MolGraph  # Explanation: imports the packaged molecule graph class used by collate functions.
+from kgcl_retro.chemistry.contextual_fg import MoleculeFGMetadata
+from kgcl_retro.chemistry.sparse_pair_builder import (
+    SparsePairMetadata,
+    build_sparse_pair_metadata,
+    merge_sparse_pair_metadata,
+)
+from kgcl_retro.config.schema import normalize_model_variant
+
+
+def _move_to_device(obj, device):
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device, non_blocking=True)
+    if obj is None:
+        return None
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return replace(obj, **{field.name: _move_to_device(getattr(obj, field.name), device) for field in fields(obj)})
+    if isinstance(obj, tuple):
+        return tuple(_move_to_device(item, device) for item in obj)
+    if isinstance(obj, list):
+        return [_move_to_device(item, device) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _move_to_device(value, device) for key, value in obj.items()}
+    return obj
+
+
+@dataclass
+class GraphBatch:
+    base_tensors: tuple[torch.Tensor, ...]
+    scopes: tuple[list[tuple[int, int]], list[tuple[int, int]]]
+    fg_metadata: list[MoleculeFGMetadata] | None = None
+    sparse_metadata: SparsePairMetadata | None = None
+    model_variant: str = "kgcl"
+
+    def to(self, device):
+        return GraphBatch(
+            base_tensors=_move_to_device(self.base_tensors, device),
+            scopes=self.scopes,
+            fg_metadata=self.fg_metadata,
+            sparse_metadata=_move_to_device(self.sparse_metadata, device),
+            model_variant=self.model_variant,
+        )
 
 def create_pad_tensor(alist):  # Explanation: defines create_pad_tensor, which pads variable-length index lists
     max_len = max([len(a) for a in alist])  # Explanation: assigns an intermediate value used by later computation
@@ -49,7 +91,78 @@ def prepare_edit_labels(graph_batch: List[MolGraph], edits: List[Any], edit_atom
     return edit_labels  # Explanation: returns this computed result to the caller
 
 
-def get_batch_graphs(graph_batch: List[MolGraph], use_rxn_class: bool = False) -> Tuple[torch.Tensor, List[Tuple[int]]]:  # Explanation: defines get_batch_graphs, which builds batched molecular graph tensors
+def prepare_contextual_edit_labels(
+    graph_batch: List[MolGraph],
+    edits: List[Any],
+    edit_atoms: List[Any],
+    bond_vocab: List,
+    atom_vocab: List,
+    sparse_metadata: SparsePairMetadata,
+) -> list[torch.Tensor]:
+    bond_vocab_size = bond_vocab.size()
+    atom_vocab_size = atom_vocab.size()
+    labels: list[torch.Tensor] = []
+    action_lengths: list[int] = []
+
+    for mol_idx, (prod_graph, edit, edit_atom) in enumerate(zip(graph_batch, edits, edit_atoms)):
+        pair_start, pair_count = sparse_metadata.action_pair_scope[mol_idx]
+        atom_start, atom_count = sparse_metadata.atom_scope[mol_idx]
+        candidate_pairs = sparse_metadata.unordered_dec_candidate_pairs[pair_start: pair_start + pair_count]
+        vector_length = pair_count * bond_vocab_size + atom_count * atom_vocab_size + 1
+        label = torch.zeros(vector_length, dtype=torch.float32)
+
+        if edit == "Terminate":
+            label[-1] = 1.0
+        elif edit[0] == "Change Atom" or edit[0] == "Attaching LG":
+            atom_map = edit_atom
+            if atom_map not in prod_graph.amap_to_idx:
+                raise ValueError(f"Gold atom map {atom_map} is not present in product graph.")
+            local_atom_idx = prod_graph.amap_to_idx[atom_map]
+            edit_idx = atom_vocab.get_index(edit)
+            label[pair_count * bond_vocab_size + local_atom_idx * atom_vocab_size + edit_idx] = 1.0
+        else:
+            atom_map_1, atom_map_2 = edit_atom[0], edit_atom[1]
+            if atom_map_1 not in prod_graph.amap_to_idx or atom_map_2 not in prod_graph.amap_to_idx:
+                raise ValueError(f"Gold bond pair {edit_atom} contains atom maps absent from product graph.")
+            pair = tuple(
+                sorted(
+                    [
+                        atom_start + prod_graph.amap_to_idx[atom_map_1],
+                        atom_start + prod_graph.amap_to_idx[atom_map_2],
+                    ]
+                )
+            )
+            pair_lookup = {tuple(row): idx for idx, row in enumerate(candidate_pairs.tolist())}
+            if pair not in pair_lookup:
+                raise ValueError(
+                    "Gold bond pair "
+                    f"{edit_atom} is absent from contextual_2fwl decoder candidates. "
+                    "Rebuild sparse pair metadata with broader candidate settings."
+                )
+            edit_idx = bond_vocab.get_index(edit)
+            label[pair_lookup[pair] * bond_vocab_size + edit_idx] = 1.0
+
+        labels.append(label)
+        action_lengths.append(vector_length)
+
+    sparse_metadata.action_vector_lengths = action_lengths
+    return labels
+
+
+def get_batch_graphs(
+    graph_batch: List[MolGraph],
+    use_rxn_class: bool = False,
+    model_variant: str = "kgcl",
+    fg_context_radius: int = 1,
+    pair_near_radius: int = 2,
+    pair_bridge_radius: int = 2,
+    pair_max_score_pairs_enc: int = 512,
+    pair_max_score_pairs_dec: int = 1024,
+    pair_max_carrier_pairs_enc: int = 1024,
+    pair_max_carrier_pairs_dec: int = 2048,
+    pair_max_bridges_enc: int = 8,
+    pair_max_bridges_dec: int = 8,
+) -> Tuple[torch.Tensor, List[Tuple[int]]]:  # Explanation: defines get_batch_graphs, which builds batched molecular graph tensors
     """
     Featurization of a batch of molecules.
     """
@@ -76,6 +189,10 @@ def get_batch_graphs(graph_batch: List[MolGraph], use_rxn_class: bool = False) -
     f_fgs = []  # Explanation: assigns an intermediate value used by later computation
     atom_num = []  # Explanation: computes an intermediate value for molecular graph editing
 
+    variant = normalize_model_variant(model_variant)
+    fg_metadata = []
+    sparse_items = []
+
     for mol_graph in graph_batch:  # Explanation: iterates over this collection to process each item
 
         f_atoms.extend(mol_graph.f_atoms)  # Explanation: executes this statement as part of collate molecular graphs and edit labels into tensors
@@ -95,6 +212,28 @@ def get_batch_graphs(graph_batch: List[MolGraph], use_rxn_class: bool = False) -
 
         a_scope.append((n_atoms, mol_graph.n_atoms))  # Explanation: executes this statement as part of collate molecular graphs and edit labels into tensors
         b_scope.append((n_undirected_bonds, mol_graph.num_bonds))  # Explanation: executes this statement as part of collate molecular graphs and edit labels into tensors
+        if variant == "contextual_2fwl":
+            if not hasattr(mol_graph, "fg_metadata"):
+                raise ValueError(
+                    "MolGraph lacks contextual FG metadata. Build MolGraph with "
+                    "model_variant='contextual_2fwl' before contextual batching."
+                )
+            fg_metadata.append(mol_graph.fg_metadata)
+            sparse_items.append(
+                build_sparse_pair_metadata(
+                    mol_graph.mol,
+                    mol_graph.fg_metadata,
+                    atom_offset=n_atoms,
+                    pair_near_radius=pair_near_radius,
+                    pair_bridge_radius=pair_bridge_radius,
+                    pair_max_score_pairs_enc=pair_max_score_pairs_enc,
+                    pair_max_score_pairs_dec=pair_max_score_pairs_dec,
+                    pair_max_carrier_pairs_enc=pair_max_carrier_pairs_enc,
+                    pair_max_carrier_pairs_dec=pair_max_carrier_pairs_dec,
+                    pair_max_bridges_enc=pair_max_bridges_enc,
+                    pair_max_bridges_dec=pair_max_bridges_dec,
+                )
+            )
         n_atoms += mol_graph.n_atoms  # Explanation: assigns an intermediate value used by later computation
         n_bonds += mol_graph.n_bonds  # Explanation: assigns an intermediate value used by later computation
 
@@ -113,6 +252,15 @@ def get_batch_graphs(graph_batch: List[MolGraph], use_rxn_class: bool = False) -
 
     graph_tensors = (f_atoms, f_bonds, f_fgs, atom_num, n_mols, a2b, b2a, b2revb, undirected_b2a)  # Explanation: computes an intermediate value for molecular graph editing
     scopes = (a_scope, b_scope)  # Explanation: assigns an intermediate value used by later computation
+
+    if variant == "contextual_2fwl":
+        return GraphBatch(
+            base_tensors=graph_tensors,
+            scopes=scopes,
+            fg_metadata=fg_metadata,
+            sparse_metadata=merge_sparse_pair_metadata(sparse_items),
+            model_variant=variant,
+        )
 
     return graph_tensors, scopes  # Explanation: returns this computed result to the caller
     

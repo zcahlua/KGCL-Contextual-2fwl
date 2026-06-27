@@ -11,7 +11,13 @@ from rdkit import Chem  # Explanation: imports selected names needed to prepare 
 from kgcl_retro.chemistry.apply import apply_edit_to_mol  # Explanation: imports the shared edit-application helper for graph sequence generation.
 from kgcl_retro.chemistry.actions import Termination  # Explanation: imports the packaged termination action for completed edit sequences.
 from kgcl_retro.chemistry.graphs import MolGraph, RxnGraph, Vocab  # Explanation: imports packaged reaction graph and vocabulary helpers.
-from kgcl_retro.data.collate import get_batch_graphs, prepare_edit_labels  # Explanation: imports packaged graph batching and edit-label helpers.
+from kgcl_retro.config.schema import add_contextual_model_args, apply_model_variant_defaults
+from kgcl_retro.data.collate import (  # Explanation: imports packaged graph batching and edit-label helpers.
+    GraphBatch,
+    get_batch_graphs,
+    prepare_contextual_edit_labels,
+    prepare_edit_labels,
+)
 from kgcl_retro.paths import resolve_project_paths  # Explanation: imports shared project-root path resolution for package CLIs.
 
 def process_batch(batch_graphs, args):  # Explanation: defines process_batch, which converts graph sequences into padded tensors and labels
@@ -37,10 +43,27 @@ def process_batch(batch_graphs, args):  # Explanation: defines process_batch, wh
         prod_graphs, edits, edit_atoms = list(zip(*graphs_idx))  # Explanation: computes an intermediate value for molecular graph editing
         assert all([isinstance(graph, MolGraph) for graph in prod_graphs])  # Explanation: checks an invariant expected by the model pipeline
 
-        edit_labels = prepare_edit_labels(  # Explanation: computes an intermediate value for molecular graph editing
-            prod_graphs, edits, edit_atoms, bond_vocab, atom_vocab)  # Explanation: executes this statement as part of prepare graph-edit training tensors
         current_graph_tensors = get_batch_graphs(  # Explanation: assigns an intermediate value used by later computation
-            prod_graphs, use_rxn_class=args.use_rxn_class)  # Explanation: computes an intermediate value for molecular graph editing
+            prod_graphs,
+            use_rxn_class=args.use_rxn_class,
+            model_variant=args.model_variant,
+            fg_context_radius=args.fg_context_radius,
+            pair_near_radius=args.pair_near_radius,
+            pair_bridge_radius=args.pair_bridge_radius,
+            pair_max_score_pairs_enc=args.pair_max_score_pairs_enc,
+            pair_max_score_pairs_dec=args.pair_max_score_pairs_dec,
+            pair_max_carrier_pairs_enc=args.pair_max_carrier_pairs_enc,
+            pair_max_carrier_pairs_dec=args.pair_max_carrier_pairs_dec,
+            pair_max_bridges_enc=args.pair_max_bridges_enc,
+            pair_max_bridges_dec=args.pair_max_bridges_dec,
+        )  # Explanation: computes an intermediate value for molecular graph editing
+        if isinstance(current_graph_tensors, GraphBatch):
+            edit_labels = prepare_contextual_edit_labels(
+                prod_graphs, edits, edit_atoms, bond_vocab, atom_vocab, current_graph_tensors.sparse_metadata
+            )
+        else:
+            edit_labels = prepare_edit_labels(  # Explanation: computes an intermediate value for molecular graph editing
+                prod_graphs, edits, edit_atoms, bond_vocab, atom_vocab)  # Explanation: executes this statement as part of prepare graph-edit training tensors
 
         graph_seq_tensors.append(current_graph_tensors)  # Explanation: executes this statement as part of prepare graph-edit training tensors
         edit_seq_labels.append(edit_labels)  # Explanation: executes this statement as part of prepare graph-edit training tensors
@@ -69,6 +92,8 @@ def prepare_data(args: Any) -> None:  # Explanation: defines prepare_data, which
         savedir = os.path.join(mode_dir, 'with_rxn_class')  # Explanation: builds the reaction-class-conditioned tensor output directory.
     else:  # Explanation: handles the fallback branch for the preceding condition
         savedir = os.path.join(mode_dir, 'without_rxn_class')  # Explanation: builds the tensor output directory without reaction-class conditioning.
+    if args.model_variant != "kgcl":
+        savedir = os.path.join(savedir, args.model_variant)
     os.makedirs(savedir, exist_ok=True)  # Explanation: creates output directories when needed
 
     for idx, rxn_data in enumerate(rxns_data):  # Explanation: iterates over this collection to process each item
@@ -92,7 +117,10 @@ def prepare_data(args: Any) -> None:  # Explanation: defines prepare_data, which
                 break  # Explanation: exits the current loop early
             if edit == 'Terminate':  # Explanation: checks this condition to choose the next execution path
                 graph = RxnGraph(prod_mol=Chem.Mol(  # Explanation: assigns an intermediate value used by later computation
-                    int_mol), edit_to_apply=edit, reac_mol=Chem.Mol(r_mol), rxn_class=rxn_data.rxn_class, use_rxn_class=args.use_rxn_class)  # Explanation: assigns an intermediate value used by later computation
+                    int_mol), edit_to_apply=edit, reac_mol=Chem.Mol(r_mol), rxn_class=rxn_data.rxn_class, use_rxn_class=args.use_rxn_class,
+                    model_variant=args.model_variant, use_contextual_fg=args.use_contextual_fg,
+                    fg_context_radius=args.fg_context_radius, fg_max_instances=args.fg_max_instances,
+                    fg_null_token=args.fg_null_token)  # Explanation: assigns an intermediate value used by later computation
                 graph_seq.append(graph)  # Explanation: executes this statement as part of prepare graph-edit training tensors
                 edit_exe = Termination(action_vocab='Terminate')  # Explanation: computes an intermediate value for molecular graph editing
                 try:  # Explanation: starts a protected block for operations that may fail
@@ -102,7 +130,10 @@ def prepare_data(args: Any) -> None:  # Explanation: defines prepare_data, which
                     final_smi = None  # Explanation: assigns an intermediate value used by later computation
             else:  # Explanation: handles the fallback branch for the preceding condition
                 graph = RxnGraph(prod_mol=Chem.Mol(int_mol), edit_to_apply=edit,  # Explanation: assigns an intermediate value used by later computation
-                                 edit_atom=rxn_data.edits_atom[i], reac_mol=Chem.Mol(r_mol), rxn_class=rxn_data.rxn_class, use_rxn_class=args.use_rxn_class)  # Explanation: computes an intermediate value for molecular graph editing
+                                 edit_atom=rxn_data.edits_atom[i], reac_mol=Chem.Mol(r_mol), rxn_class=rxn_data.rxn_class, use_rxn_class=args.use_rxn_class,
+                                 model_variant=args.model_variant, use_contextual_fg=args.use_contextual_fg,
+                                 fg_context_radius=args.fg_context_radius, fg_max_instances=args.fg_max_instances,
+                                 fg_null_token=args.fg_null_token)  # Explanation: computes an intermediate value for molecular graph editing
                 graph_seq.append(graph)  # Explanation: executes this statement as part of prepare graph-edit training tensors
                 int_mol = apply_edit_to_mol(  # Explanation: assigns an intermediate value used by later computation
                     Chem.Mol(int_mol), edit, rxn_data.edits_atom[i])  # Explanation: executes this statement as part of prepare graph-edit training tensors
@@ -150,9 +181,11 @@ def main():  # Explanation: defines main, which runs this script from command-li
                         default=1000, help='Print during preprocessing')  # Explanation: assigns an intermediate value used by later computation
     parser.add_argument('--root_dir', type=str, default='.',  # Explanation: selects the root directory containing data and experiments.
                         help='Repository/data root containing data/ and experiments/')  # Explanation: documents the package-relative root directory option.
+    add_contextual_model_args(parser)
     args = parser.parse_args()  # Explanation: parses command-line options
 
     args.dataset = args.dataset.lower()  # Explanation: assigns an intermediate value used by later computation
+    args.__dict__.update(apply_model_variant_defaults(args.__dict__))
     prepare_data(args=args)  # Explanation: assigns an intermediate value used by later computation
 
 

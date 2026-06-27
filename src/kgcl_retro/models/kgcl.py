@@ -5,12 +5,14 @@ import torch.nn as nn  # Explanation: imports torch.nn as nn for define the KGCL
 import torch.nn.functional as F  # Explanation: imports torch.nn.functional as F for define the KGCL graph-edit prediction model
 from kgcl_retro.chemistry.apply import apply_edit_to_mol  # Explanation: imports the shared packaged edit-application helper.
 from rdkit import Chem  # Explanation: imports selected names needed to define the KGCL graph-edit prediction model
-from kgcl_retro.data.collate import get_batch_graphs  # Explanation: imports packaged graph batching for autoregressive prediction.
+from kgcl_retro.config.schema import apply_model_variant_defaults
+from kgcl_retro.data.collate import GraphBatch, get_batch_graphs  # Explanation: imports packaged graph batching for autoregressive prediction.
 from kgcl_retro.chemistry.graphs import MolGraph, Vocab  # Explanation: imports packaged graph and vocabulary helpers.
 
+from kgcl_retro.models.contextual_2fwl import ContextualFGKGCL2FWL
 from kgcl_retro.models.encoder import Global_Attention, MPNEncoder  # Explanation: imports packaged D-MPNN encoder and optional global attention.
 from kgcl_retro.models.utils import (creat_edits_feats, index_select_ND,  # Explanation: imports packaged tensor utilities for edit scoring.
-                                     unbatch_feats)  # Explanation: completes the packaged model utility import list.
+                                     move_to_device, unbatch_feats)  # Explanation: completes the packaged model utility import list.
 
 
 class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network for graph-edit retrosynthesis
@@ -29,7 +31,8 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
         """
         super(KGCL, self).__init__()  # Explanation: executes this statement as part of define the KGCL graph-edit prediction model
 
-        self.config = config  # Explanation: stores this value on the object for later model operations
+        self.config = apply_model_variant_defaults(config)  # Explanation: stores this value on the object for later model operations
+        self.model_variant = self.config["model_variant"]
         self.atom_vocab = atom_vocab  # Explanation: stores this value on the object for later model operations
         self.bond_vocab = bond_vocab  # Explanation: stores this value on the object for later model operations
         self.atom_outdim = len(atom_vocab)  # Explanation: stores this value on the object for later model operations
@@ -75,6 +78,9 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
             nn.Dropout(p=config['dropout_mlp']),  # Explanation: adds dropout regularization
             nn.Linear(config['mlp_size'], 1))  # Explanation: creates a learned linear projection
 
+        if self.model_variant == "contextual_2fwl":
+            self.contextual_2fwl = ContextualFGKGCL2FWL(config, self.atom_vocab, self.bond_vocab)
+
     def to_device(self, tensors: Union[List, torch.Tensor]) -> Union[List, torch.Tensor]:  # Explanation: defines to_device, which define the KGCL graph-edit prediction model
         """Converts all inputs to the device used.
 
@@ -84,14 +90,7 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
             Tensors to convert to model device. The tensors can be either a
             single tensor or an iterable of tensors.
         """
-        if isinstance(tensors, list) or isinstance(tensors, tuple):  # Explanation: checks this condition to choose the next execution path
-            tensors = [tensor.to(self.device, non_blocking=True)  # Explanation: assigns an intermediate value used by later computation
-                       for tensor in tensors]  # Explanation: iterates over this collection to process each item
-            return tensors  # Explanation: returns this computed result to the caller
-        elif isinstance(tensors, torch.Tensor):  # Explanation: checks an alternate condition after the previous branch failed
-            return tensors.to(self.device, non_blocking=True)  # Explanation: returns this computed result to the caller
-        else:  # Explanation: handles the fallback branch for the preceding condition
-            raise ValueError(f"Tensors of type {type(tensors)} unsupported")  # Explanation: raises an error when unsupported input is encountered
+        return move_to_device(tensors, self.device)
 
     def compute_edit_scores(self, prod_tensors: Tuple[torch.Tensor],  # Explanation: defines compute_edit_scores, which define the KGCL graph-edit prediction model
                             prod_scopes: Tuple[List], prev_atom_hiddens: torch.Tensor = None,  # Explanation: computes an intermediate value for molecular graph editing
@@ -109,6 +108,16 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
         prev_atom_hiddens: torch.Tensor, default None,
             Previous hidden state of atoms.
         """
+        if self.model_variant == "contextual_2fwl":
+            if not isinstance(prod_tensors, GraphBatch):
+                raise ValueError(
+                    "Prepared data lacks sparse pair metadata. Re-run prepare_data.py "
+                    "with --model_variant contextual_2fwl."
+                )
+            graph_batch = self.to_device(prod_tensors)
+            edit_scores, graph_vecs = self.contextual_2fwl.compute_edit_scores(graph_batch)
+            return edit_scores, None, None, graph_vecs
+
         prod_tensors = self.to_device(prod_tensors)  # Explanation: computes an intermediate value for molecular graph editing
         atom_scope, bond_scope = prod_scopes  # Explanation: computes an intermediate value for molecular graph editing
         if prev_atom_hiddens is None:  # Explanation: checks this condition to choose the next execution path
@@ -136,8 +145,8 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
         prev_atom_scope = atom_scope  # Explanation: assigns an intermediate value used by later computation
 
         node_feats = atom_feats.clone()  # Explanation: assigns an intermediate value used by later computation
-        bond_starts = index_select_ND(atom_feats, index=prod_tensors[-1][:, 0])  # Explanation: computes an intermediate value for molecular graph editing
-        bond_ends = index_select_ND(atom_feats, index=prod_tensors[-1][:, 1])  # Explanation: computes an intermediate value for molecular graph editing
+        bond_starts = index_select_ND(atom_feats, index=prod_tensors[8][:, 0])  # Explanation: computes an intermediate value for molecular graph editing
+        bond_ends = index_select_ND(atom_feats, index=prod_tensors[8][:, 1])  # Explanation: computes an intermediate value for molecular graph editing
         bond_feats = torch.cat([bond_starts, bond_ends], dim=1)  # Explanation: concatenates tensors along an existing dimension
 
         graph_vecs = torch.stack(  # Explanation: stacks tensors along a new dimension
@@ -163,14 +172,18 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
             List of prod_tensors for edit sequence
         """
         max_seq_len = len(prod_seq_inputs)  # Explanation: assigns an intermediate value used by later computation
-        assert len(prod_seq_inputs[0]) == 2  # Explanation: checks an invariant expected by the model pipeline
+        if self.model_variant == "kgcl":
+            assert len(prod_seq_inputs[0]) == 2  # Explanation: checks an invariant expected by the model pipeline
 
         prev_atom_hiddens = None  # Explanation: assigns an intermediate value used by later computation
         prev_atom_scope = None  # Explanation: assigns an intermediate value used by later computation
         seq_edit_scores = []  # Explanation: computes an intermediate value for molecular graph editing
         batch_graph_outs = []  # Explanation: assigns an intermediate value used by later computation
         for idx in range(max_seq_len):  # Explanation: iterates over this collection to process each item
-            prod_tensors, prod_scopes = prod_seq_inputs[idx]  # Explanation: computes an intermediate value for molecular graph editing
+            if self.model_variant == "contextual_2fwl":
+                prod_tensors, prod_scopes = prod_seq_inputs[idx], None
+            else:
+                prod_tensors, prod_scopes = prod_seq_inputs[idx]  # Explanation: computes an intermediate value for molecular graph editing
             edit_scores, prev_atom_hiddens, prev_atom_scope, graph_outs = self.compute_edit_scores(  # Explanation: computes an intermediate value for molecular graph editing
                 prod_tensors, prod_scopes, prev_atom_hiddens, prev_atom_scope)  # Explanation: executes this statement as part of define the KGCL graph-edit prediction model
             seq_edit_scores.append(edit_scores)  # Explanation: executes this statement as part of define the KGCL graph-edit prediction model
@@ -203,13 +216,20 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
 
         products = Chem.MolFromSmiles(prod_smi)  # Explanation: parses a SMILES string into an RDKit molecule
         Chem.Kekulize(products)  # Explanation: converts aromatic bonds into kekulized form
-        prod_graph = MolGraph(mol=Chem.Mol(products),  # Explanation: computes an intermediate value for molecular graph editing
-                              rxn_class=rxn_class, use_rxn_class=use_rxn_class)  # Explanation: computes an intermediate value for molecular graph editing
-        prod_tensors, prod_scopes = get_batch_graphs(  # Explanation: computes an intermediate value for molecular graph editing
-            [prod_graph], use_rxn_class=use_rxn_class)  # Explanation: assigns an intermediate value used by later computation
+        prod_graph = self._build_predict_graph(products, rxn_class, use_rxn_class)
+        graph_batch = self._batch_predict_graph(prod_graph, use_rxn_class)
+        if self.model_variant == "contextual_2fwl":
+            prod_tensors, prod_scopes = graph_batch, None
+        else:
+            prod_tensors, prod_scopes = graph_batch
 
         while not done and steps <= max_steps:  # Explanation: continues looping while the edit-generation condition remains true
-            if prod_tensors[-1].size() == (1, 0):  # Explanation: checks this condition to choose the next execution path
+            empty_bonds = (
+                prod_tensors.base_tensors[8].size() == (1, 0)
+                if isinstance(prod_tensors, GraphBatch)
+                else prod_tensors[8].size() == (1, 0)
+            )
+            if empty_bonds:  # Explanation: checks this condition to choose the next execution path
                 edit = 'Terminate'  # Explanation: assigns an intermediate value used by later computation
                 edits.append(edit)  # Explanation: executes this statement as part of define the KGCL graph-edit prediction model
                 done = True  # Explanation: assigns an intermediate value used by later computation
@@ -220,7 +240,10 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
             idx = torch.argmax(edit_logits[0])  # Explanation: selects the highest-scoring edit index
             val = edit_logits[0][idx]  # Explanation: assigns an intermediate value used by later computation
 
-            max_bond_idx = products.GetNumBonds() * self.bond_outdim  # Explanation: assigns an intermediate value used by later computation
+            if self.model_variant == "contextual_2fwl":
+                edit, edit_atom = self.contextual_2fwl.decode_action(products, prod_tensors, edit_logits[0], idx)
+            else:
+                max_bond_idx = products.GetNumBonds() * self.bond_outdim  # Explanation: assigns an intermediate value used by later computation
 
             if idx.item() == len(edit_logits[0]) - 1:  # Explanation: checks this condition to choose the next execution path
                 edit = 'Terminate'  # Explanation: assigns an intermediate value used by later computation
@@ -228,7 +251,7 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
                 done = True  # Explanation: assigns an intermediate value used by later computation
                 break  # Explanation: exits the current loop early
 
-            elif idx.item() < max_bond_idx:  # Explanation: checks an alternate condition after the previous branch failed
+            elif self.model_variant == "kgcl" and idx.item() < max_bond_idx:  # Explanation: checks an alternate condition after the previous branch failed
                 bond_logits = edit_logits[0][:products.GetNumBonds(  # Explanation: computes an intermediate value for molecular graph editing
                 ) * self.bond_outdim]  # Explanation: executes this statement as part of define the KGCL graph-edit prediction model
                 bond_logits = bond_logits.reshape(  # Explanation: computes an intermediate value for molecular graph editing
@@ -247,7 +270,7 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
                 edit_atom = [a1, a2]  # Explanation: computes an intermediate value for molecular graph editing
                 edit = self.bond_vocab.get_elem(edit_idx)  # Explanation: assigns an intermediate value used by later computation
 
-            else:  # Explanation: handles the fallback branch for the preceding condition
+            elif self.model_variant == "kgcl":  # Explanation: handles the fallback branch for the preceding condition
                 atom_logits = edit_logits[0][max_bond_idx:-1]  # Explanation: computes an intermediate value for molecular graph editing
 
                 assert len(atom_logits) == (  # Explanation: checks that atom logits cover every atom/action pair.
@@ -267,10 +290,12 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
             try:  # Explanation: starts a protected block for operations that may fail
                 products = apply_edit_to_mol(mol=Chem.Mol(  # Explanation: assigns an intermediate value used by later computation
                     products), edit=edit, edit_atom=edit_atom)  # Explanation: assigns an intermediate value used by later computation
-                prod_graph = MolGraph(mol=Chem.Mol(  # Explanation: computes an intermediate value for molecular graph editing
-                    products),  rxn_class=rxn_class, use_rxn_class=use_rxn_class)  # Explanation: assigns an intermediate value used by later computation
-                prod_tensors, prod_scopes = get_batch_graphs(  # Explanation: computes an intermediate value for molecular graph editing
-                    [prod_graph], use_rxn_class=use_rxn_class)  # Explanation: assigns an intermediate value used by later computation
+                prod_graph = self._build_predict_graph(products, rxn_class, use_rxn_class)
+                graph_batch = self._batch_predict_graph(prod_graph, use_rxn_class)
+                if self.model_variant == "contextual_2fwl":
+                    prod_tensors, prod_scopes = graph_batch, None
+                else:
+                    prod_tensors, prod_scopes = graph_batch
 
                 edits.append(edit)  # Explanation: executes this statement as part of define the KGCL graph-edit prediction model
                 edits_atom.append(edit_atom)  # Explanation: executes this statement as part of define the KGCL graph-edit prediction model
@@ -281,6 +306,34 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
                 continue  # Explanation: skips the rest of this loop iteration
 
         return edits, edits_atom  # Explanation: returns this computed result to the caller
+
+    def _build_predict_graph(self, products, rxn_class, use_rxn_class):
+        return MolGraph(
+            mol=Chem.Mol(products),
+            rxn_class=rxn_class,
+            use_rxn_class=use_rxn_class,
+            model_variant=self.model_variant,
+            use_contextual_fg=self.config.get("use_contextual_fg", False),
+            fg_context_radius=self.config.get("fg_context_radius", 1),
+            fg_max_instances=self.config.get("fg_max_instances"),
+            fg_null_token=self.config.get("fg_null_token", True),
+        )
+
+    def _batch_predict_graph(self, prod_graph, use_rxn_class):
+        return get_batch_graphs(
+            [prod_graph],
+            use_rxn_class=use_rxn_class,
+            model_variant=self.model_variant,
+            fg_context_radius=self.config.get("fg_context_radius", 1),
+            pair_near_radius=self.config.get("pair_near_radius", 2),
+            pair_bridge_radius=self.config.get("pair_bridge_radius", 2),
+            pair_max_score_pairs_enc=self.config.get("pair_max_score_pairs_enc", 512),
+            pair_max_score_pairs_dec=self.config.get("pair_max_score_pairs_dec", 1024),
+            pair_max_carrier_pairs_enc=self.config.get("pair_max_carrier_pairs_enc", 1024),
+            pair_max_carrier_pairs_dec=self.config.get("pair_max_carrier_pairs_dec", 2048),
+            pair_max_bridges_enc=self.config.get("pair_max_bridges_enc", 8),
+            pair_max_bridges_dec=self.config.get("pair_max_bridges_dec", 8),
+        )
 
     def get_saveables(self) -> Dict:  # Explanation: defines get_saveables, which define the KGCL graph-edit prediction model
         """

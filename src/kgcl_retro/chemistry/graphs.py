@@ -2,6 +2,8 @@ from typing import List, Tuple  # Explanation: imports selected names needed to 
 from rdkit import Chem  # Explanation: imports selected names needed to represent reaction graphs and inject functional-group knowledge
 from kgcl_retro.chemistry.features import get_atom_features, get_bond_features  # Explanation: imports packaged atom and bond featurizers for graph construction.
 from kgcl_retro.chemistry.functional_groups import load_functional_group_resources  # Explanation: imports the package-resource loader for KG functional-group embeddings.
+from kgcl_retro.chemistry.contextual_fg import match_functional_group_instances
+from kgcl_retro.config.schema import normalize_model_variant
 import torch  # Explanation: imports torch for represent reaction graphs and inject functional-group knowledge
 import torch.nn.functional as F  # Explanation: imports torch.nn.functional as F for represent reaction graphs and inject functional-group knowledge
 import math  # Explanation: imports math for represent reaction graphs and inject functional-group knowledge
@@ -48,7 +50,17 @@ class MolGraph:  # Explanation: defines MolGraph, single molecule graph with fea
     'MolGraph' represents the graph structure and featurization of a single molecule.
     """
 
-    def __init__(self, mol: Chem.Mol, rxn_class: int = None, use_rxn_class: bool = False) -> None:  # Explanation: defines __init__, which represent reaction graphs and inject functional-group knowledge
+    def __init__(
+        self,
+        mol: Chem.Mol,
+        rxn_class: int = None,
+        use_rxn_class: bool = False,
+        model_variant: str = "kgcl",
+        use_contextual_fg: bool = False,
+        fg_context_radius: int = 1,
+        fg_max_instances: int | None = None,
+        fg_null_token: bool = True,
+    ) -> None:  # Explanation: defines __init__, which represent reaction graphs and inject functional-group knowledge
         """
         Parameters
         ----------
@@ -62,6 +74,11 @@ class MolGraph:  # Explanation: defines MolGraph, single molecule graph with fea
         self.mol = mol  # Explanation: stores this value on the object for later model operations
         self.rxn_class = rxn_class  # Explanation: stores this value on the object for later model operations
         self.use_rxn_class = use_rxn_class  # Explanation: stores this value on the object for later model operations
+        self.model_variant = normalize_model_variant(model_variant)
+        self.use_contextual_fg = use_contextual_fg or self.model_variant == "contextual_2fwl"
+        self.fg_context_radius = fg_context_radius
+        self.fg_max_instances = fg_max_instances
+        self.fg_null_token = fg_null_token
         self._build_mol()  # Explanation: uses or updates this object state during computation
         self._build_graph()  # Explanation: uses or updates this object state during computation
 
@@ -87,6 +104,14 @@ class MolGraph:  # Explanation: defines MolGraph, single molecule graph with fea
 
         # functional group embedding
         self.f_fgs, self.fg_names = match_fg(self.mol, self.use_rxn_class)  # Explanation: stores this value on the object for later model operations
+        if self.use_contextual_fg:
+            self.fg_metadata = match_functional_group_instances(
+                self.mol,
+                use_rxn_class=self.use_rxn_class,
+                radius=self.fg_context_radius,
+                max_instances=self.fg_max_instances,
+                include_null=self.fg_null_token,
+            )
         self.atoms = []  # Explanation: stores this value on the object for later model operations
 
         # Get atom features
@@ -100,7 +125,7 @@ class MolGraph:  # Explanation: defines MolGraph, single molecule graph with fea
             self.a2b.append([])  # Explanation: uses or updates this object state during computation
 
         # add group knowledge
-        if self.f_fgs:  # Explanation: checks this condition to choose the next execution path
+        if self.f_fgs and not self.use_contextual_fg:  # Explanation: checks this condition to choose the next execution path
             temp_tensor = torch.tensor(self.f_atoms)  # Explanation: assigns an intermediate value used by later computation
             f_fgs_tensor = torch.tensor(self.f_fgs)  # Explanation: assigns an intermediate value used by later computation
             fuse_f_atoms, self.attn_score = attention(temp_tensor, f_fgs_tensor)  # Explanation: assigns an intermediate value used by later computation
@@ -136,7 +161,10 @@ class RxnGraph:  # Explanation: defines RxnGraph, reaction state containing a pr
     """
 
     def __init__(self, prod_mol: Chem.Mol, edit_to_apply: Tuple, edit_atom: List = [], reac_mol: Chem.Mol = None,  # Explanation: defines __init__, which represent reaction graphs and inject functional-group knowledge
-                 rxn_class: int = None, use_rxn_class: bool = False) -> None:  # Explanation: computes an intermediate value for molecular graph editing
+                 rxn_class: int = None, use_rxn_class: bool = False,
+                 model_variant: str = "kgcl", use_contextual_fg: bool = False,
+                 fg_context_radius: int = 1, fg_max_instances: int | None = None,
+                 fg_null_token: bool = True) -> None:  # Explanation: computes an intermediate value for molecular graph editing
         """
         Parameters
         ----------
@@ -154,7 +182,10 @@ class RxnGraph:  # Explanation: defines RxnGraph, reaction state containing a pr
             Whether to use reaction class as additional input
         """
         self.prod_graph = MolGraph(  # Explanation: stores this value on the object for later model operations
-            mol=prod_mol, rxn_class=rxn_class, use_rxn_class=use_rxn_class)  # Explanation: assigns an intermediate value used by later computation
+            mol=prod_mol, rxn_class=rxn_class, use_rxn_class=use_rxn_class,
+            model_variant=model_variant, use_contextual_fg=use_contextual_fg,
+            fg_context_radius=fg_context_radius, fg_max_instances=fg_max_instances,
+            fg_null_token=fg_null_token)  # Explanation: assigns an intermediate value used by later computation
         if reac_mol is not None:  # Explanation: checks this condition to choose the next execution path
             self.reac_mol = reac_mol  # Explanation: stores this value on the object for later model operations
         self.edit_to_apply = edit_to_apply  # Explanation: stores this value on the object for later model operations
