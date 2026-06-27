@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kgcl-retro"
+version = "0.1.0"
+description = "Knowledge-enhanced graph contrastive learning for retrosynthesis prediction"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "KGCL maintainers" }
+]
+dependencies = [
+  "joblib",
+  "numpy",
+  "pandas",
+  "torch",
+  "tqdm"
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+chem = ["rdkit"]
+
+[project.scripts]
+kgcl-canonicalize = "kgcl_retro.cli.canonicalize_products:main"
+kgcl-preprocess = "kgcl_retro.cli.preprocess:main"
+kgcl-prepare-data = "kgcl_retro.cli.prepare_data:main"
+kgcl-train = "kgcl_retro.cli.train:cli_main"
+kgcl-eval-50k = "kgcl_retro.cli.eval_50k:main"
+kgcl-eval-full = "kgcl_retro.cli.eval_full:main"
+kgcl-eval-roundtrip = "kgcl_retro.cli.eval_roundtrip:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+kgcl_retro = [
+  "assets/KGembedding/funcgroup.txt",
+  "assets/KGembedding/fg2emb.pkl",
+  "assets/KGembedding_2/funcgroup.txt",
+  "assets/KGembedding_2/fg2emb.pkl"
+]
