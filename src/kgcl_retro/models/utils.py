@@ -1,4 +1,5 @@
 import csv  # Explanation: imports csv for provide tensor utilities and logging helpers
+from dataclasses import fields, is_dataclass, replace
 import torch  # Explanation: imports torch for provide tensor utilities and logging helpers
 from torch.nn.utils.rnn import pad_sequence  # Explanation: imports selected names needed to provide tensor utilities and logging helpers
 
@@ -25,6 +26,23 @@ def index_select_ND(source: torch.Tensor, index: torch.Tensor) -> torch.Tensor: 
     target = target.view(final_size)  # Explanation: assigns an intermediate value used by later computation
 
     return target  # Explanation: returns this computed result to the caller
+
+
+def move_to_device(obj, device):
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device, non_blocking=True)
+    if obj is None:
+        return None
+    if is_dataclass(obj) and not isinstance(obj, type):
+        updates = {field.name: move_to_device(getattr(obj, field.name), device) for field in fields(obj)}
+        return replace(obj, **updates)
+    if isinstance(obj, tuple):
+        return tuple(move_to_device(item, device) for item in obj)
+    if isinstance(obj, list):
+        return [move_to_device(item, device) for item in obj]
+    if isinstance(obj, dict):
+        return {key: move_to_device(value, device) for key, value in obj.items()}
+    return obj
 
 
 def creat_edits_feats(atom_feats, atom_scope):  # Explanation: defines creat_edits_feats, which pads atom embeddings for optional attention

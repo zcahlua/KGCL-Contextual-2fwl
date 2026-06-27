@@ -19,6 +19,12 @@ from kgcl_retro.models.utils import CSVLogger, get_seq_edit_accuracy  # Explanat
 from kgcl_retro.data.datasets import RetroEditDataset, RetroEvalDataset  # Explanation: imports packaged dataset loaders.
 from kgcl_retro.chemistry.features import ATOM_FDIM, BOND_FDIM  # Explanation: imports packaged feature dimensions for model configuration.
 from kgcl_retro.chemistry.graphs import Vocab  # Explanation: imports the packaged vocabulary helper for edit labels.
+from kgcl_retro.config.schema import (
+    CONTEXTUAL_CONFIG_DEFAULTS,
+    add_contextual_model_args,
+    apply_env_overrides,
+    apply_model_variant_defaults,
+)
 from kgcl_retro.paths import resolve_project_paths  # Explanation: imports shared project-root path resolution for package CLIs.
 
 lg = RDLogger.logger()  # Explanation: assigns an intermediate value used by later computation
@@ -49,8 +55,10 @@ def build_model_config(args):  # Explanation: defines build_model_config, which 
     model_config['atom_message'] = args['atom_message']  # Explanation: assigns an intermediate value used by later computation
     model_config['use_attn'] = args['use_attn']  # Explanation: assigns an intermediate value used by later computation
     model_config['n_heads'] = args['n_heads']  # Explanation: assigns an intermediate value used by later computation
+    for key, default in CONTEXTUAL_CONFIG_DEFAULTS.items():
+        model_config[key] = args.get(key, default)
 
-    return model_config  # Explanation: returns this computed result to the caller
+    return apply_env_overrides(apply_model_variant_defaults(model_config))  # Explanation: returns this computed result to the caller
 
 
 def save_checkpoint(model, path, epoch):  # Explanation: defines save_checkpoint, which saves model weights and reload metadata
@@ -105,12 +113,16 @@ def train_epoch(args, epoch, model, train_data, loss_fn, optimizer):  # Explanat
         p_features = torch.stack(p_feature_list)  # Explanation: stacks tensors along a new dimension
         r_features = torch.stack(r_feature_list)  # Explanation: stacks tensors along a new dimension
 
-        if args.get('use_rxn_class', False):  # use rxn class  # Explanation: checks this condition to choose the next execution path
+        contrastive_weight = args.get('contrastive_loss_weight')
+        if contrastive_weight is None and args.get('use_rxn_class', False):  # use rxn class  # Explanation: checks this condition to choose the next execution path
             loss_c = loss_adnce_2(p_features, r_features)  # Explanation: assigns an intermediate value used by later computation
-            total_loss = torch.stack(seq_loss).mean() + 0.4 * loss_c  # Explanation: stacks tensors along a new dimension
-        else:  # without rxn_class  # Explanation: handles the fallback branch for the preceding condition
+            contrastive_weight = 0.4
+        elif contrastive_weight is None:  # without rxn_class  # Explanation: handles the fallback branch for the preceding condition
             loss_c = loss_adnce_1(p_features, r_features)  # Explanation: assigns an intermediate value used by later computation
-            total_loss = torch.stack(seq_loss).mean() + 0.3 * loss_c  # Explanation: stacks tensors along a new dimension
+            contrastive_weight = 0.3
+        else:
+            loss_c = loss_adnce_2(p_features, r_features) if args.get('use_rxn_class', False) else loss_adnce_1(p_features, r_features)
+        total_loss = torch.stack(seq_loss).mean() + contrastive_weight * loss_c  # Explanation: stacks tensors along a new dimension
 
         accuracy = get_seq_edit_accuracy(seq_edit_scores, seq_labels, seq_mask)  # Explanation: assigns an intermediate value used by later computation
         train_loss += total_loss.item()  # Explanation: assigns an intermediate value used by later computation
@@ -160,6 +172,7 @@ def test(model, valid_data):  # Explanation: defines test, which validates predi
 
 def main(args):  # Explanation: defines main, which runs this script from command-line arguments
 
+    args.update(apply_model_variant_defaults(args))
     paths = resolve_project_paths(args.get('root_dir', DEFAULT_ROOT_DIR))  # Explanation: resolves the root directory used by package CLI file operations.
 
     if args['dataset'] == 'uspto_50k':  # Explanation: checks this condition to choose the next execution path
@@ -194,9 +207,11 @@ def main(args):  # Explanation: defines main, which runs this script from comman
         train_dir = os.path.join(data_dir, 'train', 'with_rxn_class')  # Explanation: builds a filesystem path
     else:  # Explanation: handles the fallback branch for the preceding condition
         train_dir = os.path.join(data_dir, 'train', 'without_rxn_class')  # Explanation: builds a filesystem path
+    if args.get("model_variant", "kgcl") != "kgcl":
+        train_dir = os.path.join(train_dir, args["model_variant"])
     eval_dir = os.path.join(data_dir, 'valid')  # Explanation: builds a filesystem path
 
-    train_dataset = RetroEditDataset(data_dir=train_dir)  # Explanation: assigns an intermediate value used by later computation
+    train_dataset = RetroEditDataset(data_dir=train_dir, model_variant=args.get("model_variant", "kgcl"))  # Explanation: assigns an intermediate value used by later computation
     train_data = train_dataset.loader(  # Explanation: assigns an intermediate value used by later computation
         batch_size=1, num_workers=args['num_workers'], shuffle=True)  # Explanation: assigns an intermediate value used by later computation
 
@@ -296,12 +311,14 @@ def build_arg_parser():  # Explanation: constructs the training argument parser 
                         help='Number of processes for data loading')  # Explanation: assigns an intermediate value used by later computation
     parser.add_argument('--root_dir', type=str, default=DEFAULT_ROOT_DIR,  # Explanation: selects the root directory containing data and experiments.
                         help='Repository/data root containing data/ and experiments/')  # Explanation: documents the package-relative root directory option.
+    add_contextual_model_args(parser)
     return parser  # Explanation: returns the configured parser to the caller.
 
 
 def cli_main():  # Explanation: parses command-line arguments and launches KGCL training.
     parser = build_arg_parser()  # Explanation: creates the shared training argument parser.
     args = parser.parse_args().__dict__  # Explanation: parses command-line options into the dict expected by main.
+    args = apply_model_variant_defaults(args)
     main(args)  # Explanation: executes this statement as part of train KGCL with edit and contrastive losses
 
 

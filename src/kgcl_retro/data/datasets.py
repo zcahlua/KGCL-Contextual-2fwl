@@ -6,11 +6,14 @@ import joblib  # Explanation: imports joblib for load processed training and eva
 import torch  # Explanation: imports torch for load processed training and evaluation data
 from torch.utils.data import DataLoader, Dataset  # Explanation: imports selected names needed to load processed training and evaluation data
 from kgcl_retro.chemistry.edits import ReactionData  # Explanation: imports the packaged reaction data tuple used by processed datasets.
+from kgcl_retro.config.schema import normalize_model_variant
+from kgcl_retro.data.collate import GraphBatch
 
 
 class RetroEditDataset(Dataset):  # Explanation: defines RetroEditDataset, dataset for saved training tensor batches
     def __init__(self, data_dir: str, **kwargs):  # Explanation: defines __init__, which load processed training and evaluation data
         self.data_dir = data_dir  # Explanation: stores this value on the object for later model operations
+        self.model_variant = normalize_model_variant(kwargs.pop("model_variant", "kgcl"))
         self.data_files = [  # Explanation: stores this value on the object for later model operations
             os.path.join(self.data_dir, file)  # Explanation: builds a filesystem path
             for file in os.listdir(self.data_dir)  # Explanation: iterates over this collection to process each item
@@ -41,6 +44,13 @@ class RetroEditDataset(Dataset):  # Explanation: defines RetroEditDataset, datas
 
         attributes = attributes[0]  # Explanation: assigns an intermediate value used by later computation
         graph_seq_tensors, edit_seq_labels, seq_mask = attributes  # Explanation: computes an intermediate value for molecular graph editing
+        if self.model_variant == "contextual_2fwl" and (
+            not graph_seq_tensors or not isinstance(graph_seq_tensors[0], GraphBatch)
+        ):
+            raise ValueError(
+                "Prepared data lacks sparse pair metadata. Re-run prepare_data.py "
+                "with --model_variant contextual_2fwl."
+            )
         return graph_seq_tensors, edit_seq_labels, seq_mask  # Explanation: returns this computed result to the caller
 
     def loader(self, batch_size: int, num_workers: int = 6, shuffle: bool = False) -> torch.utils.data.DataLoader:  # Explanation: defines loader, which load processed training and evaluation data

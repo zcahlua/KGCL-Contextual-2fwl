@@ -36,6 +36,26 @@ kgcl-eval-full --dataset uspto_full
 kgcl-eval-roundtrip --dataset uspto_50k
 ```
 
+## Optional Contextual Sparse 2-FWL Variant
+
+The default model remains the original KGCL implementation:
+
+```bash
+python train.py --dataset uspto_50k --model_variant kgcl
+```
+
+An experimental extension can be enabled with `contextual_2fwl` or either alias `contextual_fg_2fwl` / `contextual-fg-kgcl-2fwl`:
+
+```bash
+python prepare_data.py --dataset uspto_50k --mode train --model_variant contextual_2fwl
+python train.py --dataset uspto_50k --model_variant contextual_2fwl
+python eval.py --dataset uspto_50k --model_variant contextual_2fwl
+```
+
+This variant adds matched functional-group instance metadata, contextual FG attention, sparse bridge-closed ordered pair states, candidate-restricted atom/bond/stop action vectors, and candidate-pair diagnostics. Prepared data for this mode is not compatible with old baseline shards; rerun `prepare_data.py` with `--model_variant contextual_2fwl`.
+
+The pair module is sparse, local, bridge-closed, and task-restricted. It is 2-FWL-inspired, but it is not full dense 2-FWL over all `V x V` atom pairs.
+
 ## Data
 The original datasets used in this paper are from:
 

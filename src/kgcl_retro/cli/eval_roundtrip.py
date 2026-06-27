@@ -9,6 +9,7 @@ import torch  # Explanation: imports torch for evaluate round-trip accuracy
 from rdkit import Chem, RDLogger  # Explanation: imports selected names needed to evaluate round-trip accuracy
 
 from kgcl_retro.models import KGCL, BeamSearch  # Explanation: imports packaged model and beam-search classes for round-trip evaluation.
+from kgcl_retro.config.schema import add_contextual_model_args
 from kgcl_retro.paths import resolve_project_paths  # Explanation: imports shared project-root path resolution for package CLIs.
 
 lg = RDLogger.logger()  # Explanation: assigns an intermediate value used by later computation
@@ -62,6 +63,7 @@ def main():  # Explanation: defines main, which runs this script from command-li
     parser.add_argument('--max_steps', type=int, default=9, help='maximum number of edit steps')  # Explanation: limits graph edit sequence length
     parser.add_argument('--root_dir', type=str, default=DEFAULT_ROOT_DIR,  # Explanation: selects the root directory containing data and experiments.
                         help='Repository/data root containing data/ and experiments/')  # Explanation: documents the package-relative root directory option.
+    add_contextual_model_args(parser)
 
     args = parser.parse_args()  # Explanation: parses command-line options
     args.dataset = args.dataset.lower()  # Explanation: assigns an intermediate value used by later computation

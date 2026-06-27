@@ -5,7 +5,7 @@ import torch.nn.functional as F  # Explanation: imports torch.nn.functional as F
 from rdkit import Chem  # Explanation: imports selected names needed to perform beam-search inference over graph edits
 
 from kgcl_retro.chemistry.graphs import MolGraph  # Explanation: imports packaged molecule graph construction for beam states.
-from kgcl_retro.data.collate import get_batch_graphs  # Explanation: imports packaged batching used to score candidate edit states.
+from kgcl_retro.data.collate import GraphBatch, get_batch_graphs  # Explanation: imports packaged batching used to score candidate edit states.
 from kgcl_retro.chemistry.apply import apply_edit_to_mol  # Explanation: imports the shared edit-application helper used during search.
 from kgcl_retro.chemistry.actions import (AddGroupAction, AtomEditAction,  # Explanation: imports packaged action classes used to build beam edit metadata.
                                           BondEditAction, Termination)  # Explanation: completes the packaged edit action import list.
@@ -17,6 +17,41 @@ class BeamSearch:  # Explanation: defines BeamSearch, beam-search decoder for ed
         self.step_beam_size = step_beam_size  # Explanation: stores this value on the object for later model operations
         self.beam_size = beam_size  # Explanation: stores this value on the object for later model operations
         self.use_rxn_class = use_rxn_class  # Explanation: stores this value on the object for later model operations
+        self.model_variant = getattr(model, "model_variant", "kgcl")
+
+    def _graph_has_no_bonds(self, tensors):
+        if isinstance(tensors, GraphBatch):
+            return tensors.base_tensors[8].size() == (1, 0)
+        return tensors[8].size() == (1, 0)
+
+    def _build_graph(self, mol, rxn_class):
+        return MolGraph(
+            mol=Chem.Mol(mol),
+            rxn_class=rxn_class,
+            use_rxn_class=self.use_rxn_class,
+            model_variant=self.model_variant,
+            use_contextual_fg=getattr(self.model, "config", {}).get("use_contextual_fg", False),
+            fg_context_radius=getattr(self.model, "config", {}).get("fg_context_radius", 1),
+            fg_max_instances=getattr(self.model, "config", {}).get("fg_max_instances"),
+            fg_null_token=getattr(self.model, "config", {}).get("fg_null_token", True),
+        )
+
+    def _batch_graph(self, graph):
+        config = getattr(self.model, "config", {})
+        return get_batch_graphs(
+            [graph],
+            use_rxn_class=self.use_rxn_class,
+            model_variant=self.model_variant,
+            fg_context_radius=config.get("fg_context_radius", 1),
+            pair_near_radius=config.get("pair_near_radius", 2),
+            pair_bridge_radius=config.get("pair_bridge_radius", 2),
+            pair_max_score_pairs_enc=config.get("pair_max_score_pairs_enc", 512),
+            pair_max_score_pairs_dec=config.get("pair_max_score_pairs_dec", 1024),
+            pair_max_carrier_pairs_enc=config.get("pair_max_carrier_pairs_enc", 1024),
+            pair_max_carrier_pairs_dec=config.get("pair_max_carrier_pairs_dec", 2048),
+            pair_max_bridges_enc=config.get("pair_max_bridges_enc", 8),
+            pair_max_bridges_dec=config.get("pair_max_bridges_dec", 8),
+        )
 
     def process_path(self, path, rxn_class):  # Explanation: defines process_path, which perform beam-search inference over graph edits
         new_paths = []  # Explanation: assigns an intermediate value used by later computation
@@ -25,7 +60,7 @@ class BeamSearch:  # Explanation: defines BeamSearch, beam-search decoder for ed
         steps = path['steps'] + 1  # Explanation: assigns an intermediate value used by later computation
         prod_tensors = self.model.to_device(path['tensors'])  # Explanation: computes an intermediate value for molecular graph editing
 
-        if prod_tensors[-1].size() == (1, 0):  # Explanation: checks this condition to choose the next execution path
+        if self._graph_has_no_bonds(prod_tensors):  # Explanation: checks this condition to choose the next execution path
             edit = 'Terminate'  # Explanation: assigns an intermediate value used by later computation
             edits_prob, edits = [], []  # Explanation: assigns an intermediate value used by later computation
             edits_prob.extend(path['edits_prob'])  # Explanation: executes this statement as part of perform beam-search inference over graph edits
@@ -49,7 +84,7 @@ class BeamSearch:  # Explanation: defines BeamSearch, beam-search decoder for ed
             return new_paths  # Explanation: returns this computed result to the caller
 
         edit_logits, state, state_scope, graph_vecs = self.model.compute_edit_scores(  # Explanation: computes an intermediate value for molecular graph editing
-            prod_tensors, path['scopes'], path['state'], path['state_scope'])  # Explanation: executes this statement as part of perform beam-search inference over graph edits
+                prod_tensors, path['scopes'], path['state'], path['state_scope'])  # Explanation: executes this statement as part of perform beam-search inference over graph edits
         edit_logits = edit_logits[0]  # Explanation: computes an intermediate value for molecular graph editing
         edit_logits = F.softmax(edit_logits, dim=-1)  # Explanation: converts edit logits into probabilities
 
@@ -58,7 +93,7 @@ class BeamSearch:  # Explanation: defines BeamSearch, beam-search decoder for ed
 
         for beam_idx, (topk_idx, val) in enumerate(zip(*(top_k_idxs, top_k_vals))):  # Explanation: iterates over this collection to process each item
             edit, edit_atom = self.get_edit_from_logits(  # Explanation: assigns an intermediate value used by later computation
-                mol=prod_mol, edit_logits=edit_logits, idx=topk_idx, val=val)  # Explanation: assigns an intermediate value used by later computation
+                mol=prod_mol, edit_logits=edit_logits, idx=topk_idx, val=val, graph_batch=prod_tensors)  # Explanation: assigns an intermediate value used by later computation
             val = round(val.item(), 4)  # Explanation: assigns an intermediate value used by later computation
             new_prob = path['prob'] * val  # Explanation: assigns an intermediate value used by later computation
 
@@ -87,10 +122,12 @@ class BeamSearch:  # Explanation: defines BeamSearch, beam-search decoder for ed
                 try:  # Explanation: starts a protected block for operations that may fail
                     int_mol = apply_edit_to_mol(mol=Chem.Mol(  # Explanation: assigns an intermediate value used by later computation
                         prod_mol), edit=edit, edit_atom=edit_atom)  # Explanation: computes an intermediate value for molecular graph editing
-                    prod_graph = MolGraph(mol=Chem.Mol(  # Explanation: computes an intermediate value for molecular graph editing
-                        int_mol), rxn_class=rxn_class, use_rxn_class=self.use_rxn_class)  # Explanation: assigns an intermediate value used by later computation
-                    prod_tensors, prod_scopes = get_batch_graphs(  # Explanation: computes an intermediate value for molecular graph editing
-                        [prod_graph], use_rxn_class=self.use_rxn_class)  # Explanation: assigns an intermediate value used by later computation
+                    prod_graph = self._build_graph(int_mol, rxn_class)  # Explanation: computes an intermediate value for molecular graph editing
+                    graph_batch = self._batch_graph(prod_graph)
+                    if isinstance(graph_batch, GraphBatch):
+                        prod_tensors, prod_scopes = graph_batch, None
+                    else:
+                        prod_tensors, prod_scopes = graph_batch  # Explanation: assigns an intermediate value used by later computation
                     edits_prob, edits, edits_atom = [], [], []  # Explanation: assigns an intermediate value used by later computation
                     edits_prob.extend(path['edits_prob'])  # Explanation: executes this statement as part of perform beam-search inference over graph edits
                     edits_prob.append(val)  # Explanation: executes this statement as part of perform beam-search inference over graph edits
@@ -124,7 +161,10 @@ class BeamSearch:  # Explanation: defines BeamSearch, beam-search decoder for ed
 
         return filtered_paths  # Explanation: returns this computed result to the caller
 
-    def get_edit_from_logits(self, mol, edit_logits, idx, val):  # Explanation: defines get_edit_from_logits, which perform beam-search inference over graph edits
+    def get_edit_from_logits(self, mol, edit_logits, idx, val, graph_batch=None):  # Explanation: defines get_edit_from_logits, which perform beam-search inference over graph edits
+        if self.model_variant == "contextual_2fwl":
+            return self.model.contextual_2fwl.decode_action(mol, graph_batch, edit_logits, idx)
+
         max_bond_idx = mol.GetNumBonds() * self.model.bond_outdim  # Explanation: assigns an intermediate value used by later computation
 
         if idx.item() == len(edit_logits) - 1:  # Explanation: checks this condition to choose the next execution path
@@ -170,10 +210,12 @@ class BeamSearch:  # Explanation: defines BeamSearch, beam-search decoder for ed
     def run_search(self, prod_smi: str, max_steps: int = 8, rxn_class: int = None) -> List[dict]:  # Explanation: defines run_search, which perform beam-search inference over graph edits
         product = Chem.MolFromSmiles(prod_smi)  # Explanation: parses a SMILES string into an RDKit molecule
         Chem.Kekulize(product)  # Explanation: converts aromatic bonds into kekulized form
-        prod_graph = MolGraph(mol=Chem.Mol(  # Explanation: computes an intermediate value for molecular graph editing
-            product), rxn_class=rxn_class, use_rxn_class=self.use_rxn_class)  # Explanation: assigns an intermediate value used by later computation
-        prod_tensors, prod_scopes = get_batch_graphs(  # Explanation: computes an intermediate value for molecular graph editing
-            [prod_graph], use_rxn_class=self.use_rxn_class)  # Explanation: assigns an intermediate value used by later computation
+        prod_graph = self._build_graph(product, rxn_class)  # Explanation: computes an intermediate value for molecular graph editing
+        graph_batch = self._batch_graph(prod_graph)
+        if isinstance(graph_batch, GraphBatch):
+            prod_tensors, prod_scopes = graph_batch, None
+        else:
+            prod_tensors, prod_scopes = graph_batch  # Explanation: assigns an intermediate value used by later computation
 
         paths = []  # Explanation: assigns an intermediate value used by later computation
         start_path = {  # Explanation: assigns an intermediate value used by later computation
