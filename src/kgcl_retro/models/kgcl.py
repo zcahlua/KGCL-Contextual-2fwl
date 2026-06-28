@@ -94,7 +94,8 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
 
     def compute_edit_scores(self, prod_tensors: Tuple[torch.Tensor],  # Explanation: defines compute_edit_scores, which define the KGCL graph-edit prediction model
                             prod_scopes: Tuple[List], prev_atom_hiddens: torch.Tensor = None,  # Explanation: computes an intermediate value for molecular graph editing
-                            prev_atom_scope: Tuple[List] = None) :  # Explanation: assigns an intermediate value used by later computation
+                            prev_atom_scope: Tuple[List] = None,
+                            contextual_targets=None) :  # Explanation: assigns an intermediate value used by later computation
         """Computes the edit scores given product tensors and scopes.
 
         Parameters
@@ -113,9 +114,10 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
                 raise ValueError(
                     "Prepared data lacks sparse pair metadata. Re-run prepare_data.py "
                     "with --model_variant contextual_2fwl."
-                )
+            )
             graph_batch = self.to_device(prod_tensors)
-            edit_scores, graph_vecs = self.contextual_2fwl.compute_edit_scores(graph_batch)
+            edit_scores, graph_vecs = self.contextual_2fwl.compute_edit_scores(graph_batch, contextual_targets)
+            prod_tensors.sparse_metadata = graph_batch.sparse_metadata
             return edit_scores, None, None, graph_vecs
 
         prod_tensors = self.to_device(prod_tensors)  # Explanation: computes an intermediate value for molecular graph editing
@@ -162,7 +164,7 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
 
         return edit_scores, prev_atom_hiddens, prev_atom_scope, graph_vecs  # Explanation: returns this computed result to the caller
 
-    def forward(self, prod_seq_inputs: List[Tuple[torch.Tensor, List]]):  # Explanation: defines forward, which define the KGCL graph-edit prediction model
+    def forward(self, prod_seq_inputs: List[Tuple[torch.Tensor, List]], seq_labels=None):  # Explanation: defines forward, which define the KGCL graph-edit prediction model
         """
         Forward propagation step.
 
@@ -179,17 +181,27 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
         prev_atom_scope = None  # Explanation: assigns an intermediate value used by later computation
         seq_edit_scores = []  # Explanation: computes an intermediate value for molecular graph editing
         batch_graph_outs = []  # Explanation: assigns an intermediate value used by later computation
+        self.last_contextual_aux_losses = []
         for idx in range(max_seq_len):  # Explanation: iterates over this collection to process each item
             if self.model_variant == "contextual_2fwl":
                 prod_tensors, prod_scopes = prod_seq_inputs[idx], None
+                contextual_targets = seq_labels[idx] if seq_labels is not None else None
             else:
                 prod_tensors, prod_scopes = prod_seq_inputs[idx]  # Explanation: computes an intermediate value for molecular graph editing
+                contextual_targets = None
             edit_scores, prev_atom_hiddens, prev_atom_scope, graph_outs = self.compute_edit_scores(  # Explanation: computes an intermediate value for molecular graph editing
-                prod_tensors, prod_scopes, prev_atom_hiddens, prev_atom_scope)  # Explanation: executes this statement as part of define the KGCL graph-edit prediction model
+                prod_tensors, prod_scopes, prev_atom_hiddens, prev_atom_scope, contextual_targets)  # Explanation: executes this statement as part of define the KGCL graph-edit prediction model
             seq_edit_scores.append(edit_scores)  # Explanation: executes this statement as part of define the KGCL graph-edit prediction model
             batch_graph_outs.append(graph_outs)  # Explanation: executes this statement as part of define the KGCL graph-edit prediction model
+            if self.model_variant == "contextual_2fwl":
+                self.last_contextual_aux_losses.append(self.contextual_2fwl.last_proposal_loss)
 
         return seq_edit_scores, batch_graph_outs  # Explanation: returns this computed result to the caller
+
+    def map_contextual_targets(self, targets, graph_batch):
+        if self.model_variant != "contextual_2fwl":
+            raise ValueError("Dynamic contextual targets are only available for model_variant='contextual_2fwl'.")
+        return self.contextual_2fwl.map_gold_target_indices(targets, graph_batch)
 
     def predict(self, prod_smi: str, rxn_class: int = None, max_steps: int = 9):  # Explanation: defines predict, which define the KGCL graph-edit prediction model
         """Make predictions for given product smiles string.
@@ -333,6 +345,7 @@ class KGCL(nn.Module):  # Explanation: defines KGCL, main KGCL neural network fo
             pair_max_carrier_pairs_dec=self.config.get("pair_max_carrier_pairs_dec", 2048),
             pair_max_bridges_enc=self.config.get("pair_max_bridges_enc", 8),
             pair_max_bridges_dec=self.config.get("pair_max_bridges_dec", 8),
+            pair_topk=self.config.get("pair_topk", 64),
         )
 
     def get_saveables(self) -> Dict:  # Explanation: defines get_saveables, which define the KGCL graph-edit prediction model

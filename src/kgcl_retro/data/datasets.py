@@ -7,7 +7,7 @@ import torch  # Explanation: imports torch for load processed training and evalu
 from torch.utils.data import DataLoader, Dataset  # Explanation: imports selected names needed to load processed training and evaluation data
 from kgcl_retro.chemistry.edits import ReactionData  # Explanation: imports the packaged reaction data tuple used by processed datasets.
 from kgcl_retro.config.schema import normalize_model_variant
-from kgcl_retro.data.collate import GraphBatch
+from kgcl_retro.data.collate import ContextualEditTarget, GraphBatch
 
 
 class RetroEditDataset(Dataset):  # Explanation: defines RetroEditDataset, dataset for saved training tensor batches
@@ -48,9 +48,16 @@ class RetroEditDataset(Dataset):  # Explanation: defines RetroEditDataset, datas
             not graph_seq_tensors or not isinstance(graph_seq_tensors[0], GraphBatch)
         ):
             raise ValueError(
-                "Prepared data lacks sparse pair metadata. Re-run prepare_data.py "
+                "Prepared data lacks sparse pair metadata / gold action metadata. Re-run prepare_data.py "
                 "with --model_variant contextual_2fwl."
             )
+        if self.model_variant == "contextual_2fwl":
+            first_step_labels = edit_seq_labels[0] if edit_seq_labels else []
+            if not first_step_labels or not isinstance(first_step_labels[0], ContextualEditTarget):
+                raise ValueError(
+                    "Prepared data lacks sparse pair metadata / gold action metadata. Re-run prepare_data.py "
+                    "with --model_variant contextual_2fwl."
+                )
         return graph_seq_tensors, edit_seq_labels, seq_mask  # Explanation: returns this computed result to the caller
 
     def loader(self, batch_size: int, num_workers: int = 6, shuffle: bool = False) -> torch.utils.data.DataLoader:  # Explanation: defines loader, which load processed training and evaluation data

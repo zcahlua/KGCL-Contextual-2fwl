@@ -79,16 +79,34 @@ def train_epoch(args, epoch, model, train_data, loss_fn, optimizer):  # Explanat
     for batch_id, batch_data in enumerate(train_data):  # Explanation: iterates over this collection to process each item
         graph_seq_tensors, seq_labels, seq_mask = batch_data  # Explanation: computes an intermediate value for molecular graph editing
         seq_mask = seq_mask.to(DEVICE)  # Explanation: computes an intermediate value for molecular graph editing
-        seq_edit_scores, batch_graph_outs = model(graph_seq_tensors)  # Explanation: computes an intermediate value for molecular graph editing
+        is_contextual = args.get("model_variant", "kgcl") != "kgcl"
+        if is_contextual:
+            seq_edit_scores, batch_graph_outs = model(graph_seq_tensors, seq_labels)
+        else:
+            seq_edit_scores, batch_graph_outs = model(graph_seq_tensors)  # Explanation: computes an intermediate value for molecular graph editing
         max_seq_len, batch_size = seq_mask.size()  # Explanation: assigns an intermediate value used by later computation
         seq_loss = []  # Explanation: computes an intermediate value for molecular graph editing
+        contextual_target_indices = []
 
         for idx in range(max_seq_len):  # Explanation: iterates over this collection to process each item
-            edit_labels_idx = model.to_device(seq_labels[idx])  # Explanation: computes an intermediate value for molecular graph editing
+            if is_contextual:
+                target_indices = model.map_contextual_targets(seq_labels[idx], graph_seq_tensors[idx])
+                contextual_target_indices.append(target_indices)
+            else:
+                edit_labels_idx = model.to_device(seq_labels[idx])  # Explanation: computes an intermediate value for molecular graph editing
+                target_indices = torch.stack(
+                    [torch.argmax(edit_labels_idx[i]).long() for i in range(batch_size)],
+                    dim=0,
+                )
 
-            loss_batch = [seq_mask[idx][i] * loss_fn(seq_edit_scores[idx][i].unsqueeze(0),  # Explanation: assigns an intermediate value used by later computation
-                                                     torch.argmax(edit_labels_idx[i]).unsqueeze(0).long()).sum()  # Explanation: selects the highest-scoring edit index
-                          for i in range(batch_size)]  # Explanation: iterates over this collection to process each item
+            loss_batch = [
+                seq_mask[idx][i]
+                * loss_fn(
+                    seq_edit_scores[idx][i].unsqueeze(0),
+                    target_indices[i].unsqueeze(0).long(),
+                ).sum()
+                for i in range(batch_size)
+            ]  # Explanation: iterates over this collection to process each item
 
             loss = torch.stack(loss_batch, dim=0).mean()  # Explanation: stacks tensors along a new dimension
             seq_loss.append(loss)  # Explanation: executes this statement as part of train KGCL with edit and contrastive losses
@@ -123,8 +141,24 @@ def train_epoch(args, epoch, model, train_data, loss_fn, optimizer):  # Explanat
         else:
             loss_c = loss_adnce_2(p_features, r_features) if args.get('use_rxn_class', False) else loss_adnce_1(p_features, r_features)
         total_loss = torch.stack(seq_loss).mean() + contrastive_weight * loss_c  # Explanation: stacks tensors along a new dimension
+        if is_contextual:
+            proposal_losses = [loss for loss in getattr(model, "last_contextual_aux_losses", []) if loss is not None]
+            if proposal_losses:
+                total_loss = total_loss + args.get("pair_proposal_loss_weight", 0.1) * torch.stack(proposal_losses).mean()
 
-        accuracy = get_seq_edit_accuracy(seq_edit_scores, seq_labels, seq_mask)  # Explanation: assigns an intermediate value used by later computation
+        if is_contextual:
+            correct = 0.0
+            total = 0.0
+            for step_idx, target_indices in enumerate(contextual_target_indices):
+                for sample_idx in range(batch_size):
+                    if int(seq_mask[step_idx][sample_idx].item()) == 0:
+                        continue
+                    pred_idx = torch.argmax(seq_edit_scores[step_idx][sample_idx]).item()
+                    correct += float(pred_idx == int(target_indices[sample_idx].item()))
+                    total += 1.0
+            accuracy = correct / total if total else 0.0
+        else:
+            accuracy = get_seq_edit_accuracy(seq_edit_scores, seq_labels, seq_mask)  # Explanation: assigns an intermediate value used by later computation
         train_loss += total_loss.item()  # Explanation: assigns an intermediate value used by later computation
         train_acc += accuracy  # Explanation: assigns an intermediate value used by later computation
 

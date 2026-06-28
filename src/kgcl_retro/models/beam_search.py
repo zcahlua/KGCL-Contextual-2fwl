@@ -51,6 +51,7 @@ class BeamSearch:  # Explanation: defines BeamSearch, beam-search decoder for ed
             pair_max_carrier_pairs_dec=config.get("pair_max_carrier_pairs_dec", 2048),
             pair_max_bridges_enc=config.get("pair_max_bridges_enc", 8),
             pair_max_bridges_dec=config.get("pair_max_bridges_dec", 8),
+            pair_topk=config.get("pair_topk", 64),
         )
 
     def process_path(self, path, rxn_class):  # Explanation: defines process_path, which perform beam-search inference over graph edits

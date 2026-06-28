@@ -1,10 +1,13 @@
 import pytest
 
 Chem = pytest.importorskip("rdkit.Chem")
-pytest.importorskip("torch")
+torch = pytest.importorskip("torch")
 
+from kgcl_retro.chemistry.features import ATOM_FDIM, BOND_FDIM
 from kgcl_retro.chemistry.contextual_fg import match_functional_group_instances
 from kgcl_retro.chemistry.graphs import MolGraph
+from kgcl_retro.data.collate import get_batch_graphs
+from kgcl_retro.models.contextual_fg import ContextualFGEncoder
 
 
 def test_contextual_fg_null_token_for_molecule_without_matches():
@@ -67,3 +70,27 @@ def test_molgraph_contextual_mode_skips_inline_fg_attention():
     assert hasattr(contextual, "fg_metadata")
     assert contextual.f_atoms != baseline.f_atoms
     assert not hasattr(contextual, "attn_score")
+
+
+def test_local_fg_encoder_uses_context_edges():
+    mol = Chem.MolFromSmiles("[CH3:1][CH2:2][OH:3]")
+    graph = MolGraph(mol=mol, model_variant="contextual_2fwl", use_contextual_fg=True, fg_context_radius=1)
+    graph_batch = get_batch_graphs([graph], model_variant="contextual_2fwl")
+    encoder = ContextualFGEncoder(
+        atom_hidden_size=8,
+        fg_hidden_size=8,
+        fg_layers=2,
+        kg_embedding_size=8,
+        bond_feature_size=ATOM_FDIM + BOND_FDIM,
+    )
+    atom_states = torch.randn(graph_batch.base_tensors[0].size(0), 8)
+    atom_scope, _ = graph_batch.scopes
+
+    base_out = encoder(atom_states, graph_batch.fg_metadata, atom_scope, graph_tensors=graph_batch.base_tensors)
+    f_atoms, f_bonds, f_fgs, atom_num, n_mols, a2b, b2a, b2revb, undirected_b2a = graph_batch.base_tensors
+    changed_bonds = f_bonds.clone()
+    changed_bonds[1:] = changed_bonds[1:] + 1.0
+    changed_tensors = (f_atoms, changed_bonds, f_fgs, atom_num, n_mols, a2b, b2a, b2revb, undirected_b2a)
+    changed_out = encoder(atom_states, graph_batch.fg_metadata, atom_scope, graph_tensors=changed_tensors)
+
+    assert not torch.allclose(base_out.fg_embeddings, changed_out.fg_embeddings)
