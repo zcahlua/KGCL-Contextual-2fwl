@@ -31,10 +31,14 @@ class ContextualFGEncoder(nn.Module):
         max_fg_types: int = 512,
         max_distance_bucket: int = 8,
         bond_feature_size: int | None = None,
+        fg_pool: str = "sum",
     ) -> None:
         super().__init__()
         self.atom_hidden_size = atom_hidden_size
         self.fg_hidden_size = fg_hidden_size
+        if fg_pool not in {"sum", "mean", "max"}:
+            raise ValueError("fg_pool must be one of: sum, mean, max")
+        self.fg_pool = fg_pool
         self.fg_use_boundary_pool = fg_use_boundary_pool
         self.fg_use_distance_bias = fg_use_distance_bias
         self.fg_use_membership_bias = fg_use_membership_bias
@@ -97,7 +101,12 @@ class ContextualFGEncoder(nn.Module):
     def _pool(self, atom_states: torch.Tensor, atom_indices: list[int], null_value: torch.Tensor) -> torch.Tensor:
         if not atom_indices:
             return null_value
-        return atom_states[torch.tensor(atom_indices, dtype=torch.long, device=atom_states.device)].sum(dim=0)
+        selected = atom_states[torch.tensor(atom_indices, dtype=torch.long, device=atom_states.device)]
+        if self.fg_pool == "mean":
+            return selected.mean(dim=0)
+        if self.fg_pool == "max":
+            return selected.max(dim=0).values
+        return selected.sum(dim=0)
 
     def _context_edges(
         self,
