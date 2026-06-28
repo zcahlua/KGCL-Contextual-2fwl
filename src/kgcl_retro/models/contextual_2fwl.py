@@ -50,19 +50,31 @@ class ContextualFGKGCL2FWL(nn.Module):
             fg_use_membership_bias=config.get("fg_use_membership_bias", True),
             kg_embedding_size=config.get("kg_embedding_size", 256),
             bond_feature_size=config["n_bond_feat"],
+            fg_pool=config.get("fg_pool", "sum"),
         )
         self.relation_encoder = PairRelationEncoder(self.pair_relation_size)
-        pair_init_dim = self.hidden_size * 4 + self.pair_relation_size + 1
+        self.pair_fg_context = nn.Sequential(
+            nn.Linear(self.hidden_size * 3, self.hidden_size),
+            nn.SELU(),
+            nn.Linear(self.hidden_size, self.hidden_size),
+        )
+        pair_init_dim = self.hidden_size * 5 + self.pair_relation_size + 1
         self.pair_init = nn.Sequential(
             nn.Linear(pair_init_dim, self.pair_hidden_size),
             nn.SELU(),
             nn.Linear(self.pair_hidden_size, self.pair_hidden_size),
         )
         self.reuse_pair = nn.Linear(self.pair_hidden_size, self.pair_hidden_size)
+        pair_enc_layers = int(config.get("pair_enc_layers", 1))
+        if pair_enc_layers > int(config.get("depth", 1)):
+            raise ValueError(
+                "pair_enc_layers cannot exceed depth. When pair_enc_layers < depth, "
+                "the final encoder pair layer is intentionally shared across later D-MPNN steps."
+            )
         self.encoder_pair_layers = nn.ModuleList(
             [
                 SparsePairLayer(self.pair_hidden_size, self.pair_relation_size)
-                for _ in range(config.get("pair_enc_layers", 1))
+                for _ in range(pair_enc_layers)
             ]
         )
         self.decoder = Sparse2FWLDecoder(
@@ -118,8 +130,11 @@ class ContextualFGKGCL2FWL(nn.Module):
         right = atom_states[pairs[:, 1]]
         left_fg = atom_fg_context[pairs[:, 0]]
         right_fg = atom_fg_context[pairs[:, 1]]
+        omega_fg = self.pair_fg_context(
+            torch.cat([left_fg + right_fg, torch.abs(left_fg - right_fg), left_fg * right_fg], dim=1)
+        )
         diag = (pairs[:, 0] == pairs[:, 1]).to(dtype=atom_states.dtype, device=atom_states.device).unsqueeze(1)
-        return self.pair_init(torch.cat([left, right, pair_rel, left_fg, right_fg, diag], dim=1))
+        return self.pair_init(torch.cat([left, right, pair_rel, left_fg, right_fg, omega_fg, diag], dim=1))
 
     def _apply_pair_feedback(
         self,
@@ -172,7 +187,7 @@ class ContextualFGKGCL2FWL(nn.Module):
             a_message = nei_a_message.sum(dim=1)
             rev_message = edge_states[b2revb]
             edge_message = a_message[b2a] - rev_message
-            edge_states = self.edge_gru(edge_initial, edge_message) * edge_mask
+            edge_states = self.edge_gru(edge_message, edge_states) * edge_mask
             edge_states = self.edge_dropout(edge_states)
 
             incoming = index_select_ND(edge_states, a2b).sum(dim=1)
@@ -387,20 +402,26 @@ class ContextualFGKGCL2FWL(nn.Module):
         sparse = graph_batch.sparse_metadata
         atom_states, _edge_states, enc_pair_states, _enc_pair_rel, fg_out = self._encode_contextual_graph(graph_batch)
         atom_fg_context = fg_out.atom_fg_context
-        proposal_pair_rel = self.relation_encoder(sparse.proposal_pair_relation_features)
-        proposal_fg_context = self._fg_pair_context(atom_fg_context, sparse.proposal_universe_pairs)
-        proposal_logits = self.proposal_head(
-            atom_states,
-            sparse.proposal_universe_pairs,
-            proposal_pair_rel,
-            proposal_fg_context,
-        )
-        proposal_targets = self._proposal_targets(sparse.proposal_universe_pairs, targets)
-        if proposal_logits.numel():
-            self.last_proposal_loss = F.binary_cross_entropy_with_logits(proposal_logits, proposal_targets)
+        use_proposal = bool(self.config.get("pair_use_proposal", True))
+        if use_proposal:
+            proposal_pair_rel = self.relation_encoder(sparse.proposal_pair_relation_features)
+            proposal_fg_context = self._fg_pair_context(atom_fg_context, sparse.proposal_universe_pairs)
+            proposal_logits = self.proposal_head(
+                atom_states,
+                sparse.proposal_universe_pairs,
+                proposal_pair_rel,
+                proposal_fg_context,
+            )
+            proposal_targets = self._proposal_targets(sparse.proposal_universe_pairs, targets)
+            if proposal_logits.numel():
+                self.last_proposal_loss = F.binary_cross_entropy_with_logits(proposal_logits, proposal_targets)
+            else:
+                self.last_proposal_loss = atom_states.sum() * 0.0
+            proposal_topk_pairs = self._select_topk_pairs(sparse, proposal_logits)
         else:
+            proposal_logits = torch.zeros((0,), dtype=atom_states.dtype, device=atom_states.device)
             self.last_proposal_loss = atom_states.sum() * 0.0
-        proposal_topk_pairs = self._select_topk_pairs(sparse, proposal_logits)
+            proposal_topk_pairs = [set() for _ in sparse.proposal_pair_scope]
         self._build_dynamic_decoder(graph_batch, proposal_topk_pairs, targets)
 
         dec_pair_rel = self.relation_encoder(sparse.dec_pair_relation_features)
@@ -443,6 +464,12 @@ class ContextualFGKGCL2FWL(nn.Module):
             **fg_out.diagnostics,
             "proposal_logits": proposal_logits.detach(),
             "proposal_bce": float(self.last_proposal_loss.detach().cpu().item()),
+            "proposal_enabled": use_proposal,
+            "encoder_pair_layer_mode": (
+                "shared_final"
+                if self.encoder_pair_layers and len(self.encoder_pair_layers) < int(self.config.get("depth", 1))
+                else "one_to_one"
+            ),
             "Recall_bond(S_topK)": float(topk_hits / gold_count) if gold_count else 1.0,
             "Recall_bond(S_dec_test_score)": float(inference_hits / gold_count) if gold_count else 1.0,
             "Recall_atom": 1.0,
