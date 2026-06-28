@@ -184,10 +184,12 @@ def test(model, valid_data):  # Explanation: defines test, which validates predi
     model.eval()  # Explanation: executes this statement as part of train KGCL with edit and contrastive losses
     total_accuracy = 0.0  # Explanation: assigns an intermediate value used by later computation
     first_step_accuracy = 0.0  # Explanation: assigns an intermediate value used by later computation
+    n_eval = 0
     with torch.no_grad():  # Explanation: opens a managed resource and closes it automatically
         for batch_id, batch_data in enumerate(valid_data):  # Explanation: iterates over this collection to process each item
             prod_smi_batch, edits_batch, edits_atom_batch, rxn_classes = batch_data  # Explanation: computes an intermediate value for molecular graph editing
             for idx, prod_smi in enumerate(prod_smi_batch):  # Explanation: iterates over this collection to process each item
+                n_eval += 1
                 if rxn_classes is None:  # Explanation: checks this condition to choose the next execution path
                     edits, edits_atom = model.predict(prod_smi)  # Explanation: assigns an intermediate value used by later computation
                 else:  # Explanation: handles the fallback branch for the preceding condition
@@ -197,9 +199,9 @@ def test(model, valid_data):  # Explanation: defines test, which validates predi
                     total_accuracy += 1.0  # Explanation: assigns an intermediate value used by later computation
                 if edits[0] == edits_batch[idx][0] and edits_atom[0] == edits_atom_batch[idx][0]:  # Explanation: checks this condition to choose the next execution path
                     first_step_accuracy += 1.0  # Explanation: assigns an intermediate value used by later computation
-    valid_acc = float('%.4f' % (total_accuracy / len(valid_data)))  # Explanation: assigns an intermediate value used by later computation
+    valid_acc = float('%.4f' % (total_accuracy / max(n_eval, 1)))  # Explanation: assigns an intermediate value used by later computation
     valid_first_step_acc = float(  # Explanation: assigns an intermediate value used by later computation
-        '%.4f' % (first_step_accuracy / len(valid_data)))  # Explanation: executes this statement as part of train KGCL with edit and contrastive losses
+        '%.4f' % (first_step_accuracy / max(n_eval, 1)))  # Explanation: executes this statement as part of train KGCL with edit and contrastive losses
 
     return valid_acc, valid_first_step_acc  # Explanation: returns this computed result to the caller
 

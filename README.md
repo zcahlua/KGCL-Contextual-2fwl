@@ -56,6 +56,8 @@ This variant adds matched functional-group instance metadata, local contextual F
 
 The pair module is sparse, local, bridge-closed, and task-restricted. It is 2-FWL-inspired, but it is not full dense 2-FWL over all `V x V` atom pairs.
 
+Contextual options exposed by the CLI are honored directly: `--fg_pool {sum,mean,max}` controls contextual FG core/boundary pooling, and `--no-pair_use_proposal` disables proposal scoring so decoder candidates are built from encoder score pairs plus train-time teacher-forced gold pairs only. If `pair_enc_layers` is smaller than `depth`, the final encoder pair layer is intentionally shared across later D-MPNN steps; values larger than `depth` are rejected to avoid silently unused pair layers.
+
 ## Data
 The original datasets used in this paper are from:
 

@@ -94,3 +94,18 @@ def test_local_fg_encoder_uses_context_edges():
     changed_out = encoder(atom_states, graph_batch.fg_metadata, atom_scope, graph_tensors=changed_tensors)
 
     assert not torch.allclose(base_out.fg_embeddings, changed_out.fg_embeddings)
+
+
+def test_contextual_fg_pool_honors_mean_mode():
+    encoder = ContextualFGEncoder(
+        atom_hidden_size=2,
+        fg_hidden_size=2,
+        fg_layers=1,
+        kg_embedding_size=2,
+        fg_pool="mean",
+    )
+    atom_states = torch.tensor([[2.0, 4.0], [6.0, 8.0]])
+
+    pooled = encoder._pool(atom_states, [0, 1], torch.zeros(2))
+
+    assert torch.allclose(pooled, torch.tensor([4.0, 6.0]))

@@ -135,6 +135,70 @@ def test_gold_pair_train_only_not_in_inference_candidates():
     assert training.diagnostics["gold_pairs_rescued_by_teacher_forcing"] == 1
 
 
+def test_training_gold_pair_survives_decoder_score_cap():
+    mol = Chem.MolFromSmiles("CCO")
+    fg_metadata = match_functional_group_instances(mol, False, radius=1)
+    encoder = build_encoder_pair_metadata(
+        mol,
+        fg_metadata,
+        atom_offset=1,
+        pair_near_radius=1,
+        pair_bridge_radius=1,
+    )
+
+    training = build_decoder_pair_metadata(
+        mol,
+        fg_metadata,
+        enc_score_pairs=_pairs(encoder.enc_score_pairs),
+        proposal_topk_pairs=set(),
+        gold_bond_pairs={(1, 3)},
+        atom_offset=1,
+        pair_near_radius=1,
+        pair_bridge_radius=1,
+        pair_max_score_pairs_dec=7,
+        training=True,
+    )
+
+    assert (1, 3) in _pairs(training.unordered_dec_candidate_pairs)
+
+
+def test_gold_only_pairs_do_not_bridge_unrelated_decoder_candidates():
+    mol = Chem.MolFromSmiles("CCCC")
+    fg_metadata = match_functional_group_instances(mol, False, radius=1)
+    encoder = build_encoder_pair_metadata(
+        mol,
+        fg_metadata,
+        atom_offset=1,
+        pair_near_radius=1,
+        pair_bridge_radius=1,
+    )
+
+    decoder = build_decoder_pair_metadata(
+        mol,
+        fg_metadata,
+        enc_score_pairs=_pairs(encoder.enc_score_pairs),
+        proposal_topk_pairs={(1, 4)},
+        gold_bond_pairs={(1, 3)},
+        atom_offset=1,
+        pair_near_radius=1,
+        pair_bridge_radius=2,
+        pair_max_bridges_dec=4,
+        training=True,
+    )
+
+    pair_lookup = {tuple(pair): idx for idx, pair in enumerate(decoder.dec_carrier_pairs_base.tolist())}
+    pair_idx = pair_lookup[(1, 4)]
+    bridges = {
+        int(bridge)
+        for bridge, enabled in zip(
+            decoder.dec_bridge_index_base[pair_idx].tolist(),
+            decoder.dec_bridge_mask_base[pair_idx].tolist(),
+        )
+        if enabled
+    }
+    assert 3 not in bridges
+
+
 def test_proposal_bridges_added_to_decoder():
     mol = Chem.MolFromSmiles("CCO")
     fg_metadata = match_functional_group_instances(mol, False, radius=1)

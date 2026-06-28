@@ -341,10 +341,14 @@ def _bridge_tensors(
     pair_bridge_radius: int,
     max_bridges: int,
     proposal_pairs: set[tuple[int, int]] | None = None,
+    blocked_bridge_pairs: set[tuple[int, int]] | None = None,
+    protected_pairs: set[tuple[int, int]] | None = None,
 ) -> tuple[torch.LongTensor, torch.BoolTensor]:
     rows: list[list[int]] = []
     masks: list[list[bool]] = []
     carrier = set(carrier_pairs)
+    blocked = _with_reversals(blocked_bridge_pairs or set())
+    protected = _with_reversals(protected_pairs or set())
     for i, j in sorted(carrier_pairs):
         candidates = _bridge_atoms(
             mol,
@@ -356,7 +360,15 @@ def _bridge_tensors(
             max_bridges * 2,
             proposal_pairs=proposal_pairs,
         )
-        closed = [u for u in candidates if (i, u) in carrier and (u, j) in carrier][:max_bridges]
+        closed = []
+        for u in candidates:
+            if (i, u) not in carrier or (u, j) not in carrier:
+                continue
+            if (i, j) not in protected and ((i, u) in blocked or (u, j) in blocked):
+                continue
+            closed.append(u)
+            if len(closed) == max_bridges:
+                break
         padded = closed + [0] * (max_bridges - len(closed))
         rows.append(padded)
         masks.append([True] * len(closed) + [False] * (max_bridges - len(closed)))
@@ -477,12 +489,16 @@ def build_decoder_pair_metadata(
     proposal_unordered = _normalize_unordered_pairs(proposal_topk_pairs)
     proposal_directed = _with_reversals(proposal_unordered)
     gold_unordered = _normalize_unordered_pairs(gold_bond_pairs or [])
+    inference_candidates = _normalize_unordered_pairs(enc_score) | proposal_unordered
+    rescued = gold_unordered - inference_candidates if training else set()
     score_pairs = set(enc_score)
     score_pairs.update(proposal_directed)
     if training:
         score_pairs.update(_with_reversals(gold_unordered))
     required = _required_pairs(mol, atom_offset)
     required.update(enc_score)
+    if training:
+        required.update(_with_reversals(gold_unordered))
     score_pairs = _cap_reversal_closed(score_pairs, pair_max_score_pairs_dec, required)
     carrier = _carrier_pairs(
         mol,
@@ -494,6 +510,7 @@ def build_decoder_pair_metadata(
         pair_max_bridges_dec,
         proposal_pairs=proposal_unordered,
     )
+    gold_rescued_directed = _with_reversals(rescued)
     bridge_index, bridge_mask = _bridge_tensors(
         mol,
         fg_metadata,
@@ -502,12 +519,12 @@ def build_decoder_pair_metadata(
         pair_bridge_radius,
         pair_max_bridges_dec,
         proposal_pairs=proposal_unordered,
+        blocked_bridge_pairs=gold_rescued_directed,
+        protected_pairs=gold_rescued_directed,
     )
     carrier_tensor = _to_tensor(carrier)
     relation_codes, relation_features = _relation_tensors(mol, fg_metadata, carrier_tensor, atom_offset)
     action_pairs = _unordered_candidates(score_pairs)
-    inference_candidates = _normalize_unordered_pairs(enc_score) | proposal_unordered
-    rescued = gold_unordered - inference_candidates if training else set()
     absent_in_inference = gold_unordered - inference_candidates
     diagnostics = {
         "num_dec_score": len(score_pairs),
@@ -516,6 +533,7 @@ def build_decoder_pair_metadata(
         "fraction_dec_nonempty_bridge": float(bridge_mask.any(dim=1).float().mean().item()) if bridge_mask.numel() else 0.0,
         "gold_pairs_absent_from_inference": len(absent_in_inference),
         "gold_pairs_rescued_by_teacher_forcing": len(rescued),
+        "gold_only_bridge_pairs_blocked": len(gold_rescued_directed),
     }
     empty_pairs = torch.zeros((0, 2), dtype=torch.long)
     return SparsePairMetadata(
