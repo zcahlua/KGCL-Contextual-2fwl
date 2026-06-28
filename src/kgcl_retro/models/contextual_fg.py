@@ -30,6 +30,7 @@ class ContextualFGEncoder(nn.Module):
         kg_embedding_size: int = 256,
         max_fg_types: int = 512,
         max_distance_bucket: int = 8,
+        bond_feature_size: int | None = None,
     ) -> None:
         super().__init__()
         self.atom_hidden_size = atom_hidden_size
@@ -39,9 +40,35 @@ class ContextualFGEncoder(nn.Module):
         self.fg_use_membership_bias = fg_use_membership_bias
         self.kg_embedding_size = kg_embedding_size
         self.max_distance_bucket = max_distance_bucket
+        self.fg_layers = max(1, fg_layers)
 
         self.atom_project = nn.Linear(atom_hidden_size, fg_hidden_size)
+        self.bond_project = nn.Linear(bond_feature_size or atom_hidden_size, fg_hidden_size)
         self.fg_type_embedding = nn.Embedding(max_fg_types, fg_hidden_size)
+        self.core_embedding = nn.Embedding(2, fg_hidden_size)
+        self.local_distance_embedding = nn.Embedding(max_distance_bucket + 2, fg_hidden_size)
+        self.local_message_mlps = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(fg_hidden_size * 5 + 2, fg_hidden_size),
+                    nn.SELU(),
+                    nn.Linear(fg_hidden_size, fg_hidden_size),
+                )
+                for _ in range(self.fg_layers)
+            ]
+        )
+        self.local_update_mlps = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(fg_hidden_size * 2, fg_hidden_size),
+                    nn.SELU(),
+                    nn.Linear(fg_hidden_size, fg_hidden_size),
+                )
+                for _ in range(self.fg_layers)
+            ]
+        )
+        self.local_norms = nn.ModuleList([nn.LayerNorm(fg_hidden_size) for _ in range(self.fg_layers)])
+        self.local_null_message = nn.Parameter(torch.zeros(fg_hidden_size))
         self.context_mlp = nn.Sequential(
             nn.Linear(fg_hidden_size * 3, fg_hidden_size),
             nn.SELU(),
@@ -72,24 +99,96 @@ class ContextualFGEncoder(nn.Module):
             return null_value
         return atom_states[torch.tensor(atom_indices, dtype=torch.long, device=atom_states.device)].sum(dim=0)
 
+    def _context_edges(
+        self,
+        graph_tensors: tuple[torch.Tensor, ...] | None,
+        context_abs: list[int],
+    ) -> list[tuple[int, int, torch.Tensor]]:
+        if graph_tensors is None or not context_abs:
+            return []
+        _f_atoms, f_bonds, _f_fgs, _atom_num, _n_mols, _a2b, b2a, b2revb, _undirected_b2a = graph_tensors
+        context_lookup = {atom_abs: idx for idx, atom_abs in enumerate(context_abs)}
+        edges: list[tuple[int, int, torch.Tensor]] = []
+        for bond_idx in range(1, int(f_bonds.size(0))):
+            src_abs = int(b2a[bond_idx].item())
+            rev_idx = int(b2revb[bond_idx].item())
+            if rev_idx <= 0 or rev_idx >= int(b2a.size(0)):
+                continue
+            dst_abs = int(b2a[rev_idx].item())
+            if src_abs in context_lookup and dst_abs in context_lookup:
+                edges.append((context_lookup[src_abs], context_lookup[dst_abs], f_bonds[bond_idx]))
+        return edges
+
+    def _run_local_mpnn(
+        self,
+        atom_states: torch.Tensor,
+        instance,
+        atom_offset: int,
+        graph_tensors: tuple[torch.Tensor, ...] | None,
+    ) -> tuple[torch.Tensor, list[int], list[bool], list[bool]]:
+        context_abs = [atom_offset + atom_idx for atom_idx in instance.context_atom_indices]
+        if not context_abs:
+            return self.null_fg.unsqueeze(0), [], [], []
+        core_set = {atom_offset + atom_idx for atom_idx in instance.core_atom_indices}
+        context_local = [atom_abs - atom_offset for atom_abs in context_abs]
+        core_mask = [atom_abs in core_set for atom_abs in context_abs]
+        boundary_mask = [not flag for flag in core_mask]
+        projected = self.atom_project(atom_states[torch.tensor(context_abs, dtype=torch.long, device=atom_states.device)])
+        type_idx = max(0, min(instance.fg_type_index, self.fg_type_embedding.num_embeddings - 1))
+        type_emb = self.fg_type_embedding(torch.tensor(type_idx, dtype=torch.long, device=atom_states.device))
+        core_ids = torch.tensor([1 if flag else 0 for flag in core_mask], dtype=torch.long, device=atom_states.device)
+        dist_ids = torch.tensor(
+            [self._distance_bucket(instance.distance_to_core.get(local_atom, "inf")) for local_atom in context_local],
+            dtype=torch.long,
+            device=atom_states.device,
+        )
+        states = projected + self.core_embedding(core_ids) + self.local_distance_embedding(dist_ids) + type_emb
+        edges = self._context_edges(graph_tensors, context_abs)
+        dist_embeddings = self.local_distance_embedding(dist_ids)
+        core_flags = core_ids.to(dtype=atom_states.dtype).unsqueeze(1)
+        for layer_idx in range(self.fg_layers):
+            messages = torch.zeros_like(states)
+            counts = torch.zeros((states.size(0), 1), dtype=states.dtype, device=states.device)
+            for src_idx, dst_idx, bond_feature in edges:
+                bond_emb = self.bond_project(bond_feature.to(device=atom_states.device, dtype=atom_states.dtype))
+                msg = self.local_message_mlps[layer_idx](
+                    torch.cat(
+                        [
+                            states[dst_idx],
+                            states[src_idx],
+                            bond_emb,
+                            dist_embeddings[dst_idx],
+                            dist_embeddings[src_idx],
+                            core_flags[dst_idx],
+                            core_flags[src_idx],
+                        ],
+                        dim=0,
+                    )
+                )
+                messages[dst_idx] = messages[dst_idx] + msg
+                counts[dst_idx, 0] = counts[dst_idx, 0] + 1.0
+            messages = torch.where(counts > 0.0, messages / counts.clamp(min=1.0), self.local_null_message)
+            delta = self.local_update_mlps[layer_idx](torch.cat([states, messages], dim=1))
+            states = self.local_norms[layer_idx](states + delta)
+        return states, context_abs, core_mask, boundary_mask
+
     def _instance_embedding(
         self,
         atom_states: torch.Tensor,
         instance,
         atom_offset: int,
+        graph_tensors: tuple[torch.Tensor, ...] | None = None,
     ) -> torch.Tensor:
         if instance.is_null:
             return self.null_fg
 
-        core_abs = [atom_offset + atom_idx for atom_idx in instance.core_atom_indices]
-        boundary_abs = [
-            atom_offset + atom_idx
-            for atom_idx, is_boundary in zip(instance.context_atom_indices, instance.boundary_mask)
-            if is_boundary
-        ]
-        projected_atoms = self.atom_project(atom_states)
-        core_pool = self._pool(projected_atoms, core_abs, self.null_fg)
-        boundary_pool = self._pool(projected_atoms, boundary_abs, self.boundary_null)
+        local_states, _context_abs, core_mask, boundary_mask = self._run_local_mpnn(
+            atom_states, instance, atom_offset, graph_tensors
+        )
+        core_indices = [idx for idx, flag in enumerate(core_mask) if flag]
+        boundary_indices = [idx for idx, flag in enumerate(boundary_mask) if flag]
+        core_pool = self._pool(local_states, core_indices, self.null_fg)
+        boundary_pool = self._pool(local_states, boundary_indices, self.boundary_null)
         type_idx = max(0, min(instance.fg_type_index, self.fg_type_embedding.num_embeddings - 1))
         type_emb = self.fg_type_embedding(
             torch.tensor(type_idx, dtype=torch.long, device=atom_states.device)
@@ -120,6 +219,7 @@ class ContextualFGEncoder(nn.Module):
         atom_states: torch.Tensor,
         fg_metadata: list[MoleculeFGMetadata],
         atom_scope: list[tuple[int, int]],
+        graph_tensors: tuple[torch.Tensor, ...] | None = None,
     ) -> ContextualFGOutput:
         fg_embeddings: list[torch.Tensor] = []
         fg_instance_scope: list[tuple[int, int]] = []
@@ -130,7 +230,7 @@ class ContextualFGEncoder(nn.Module):
             atom_offset, atom_count = atom_scope[mol_idx]
             start = len(fg_embeddings)
             mol_embeddings = [
-                self._instance_embedding(atom_states, instance, atom_offset)
+                self._instance_embedding(atom_states, instance, atom_offset, graph_tensors=graph_tensors)
                 for instance in metadata.instances
             ]
             if not mol_embeddings:

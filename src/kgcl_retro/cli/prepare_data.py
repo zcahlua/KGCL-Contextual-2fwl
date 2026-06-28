@@ -56,6 +56,7 @@ def process_batch(batch_graphs, args):  # Explanation: defines process_batch, wh
             pair_max_carrier_pairs_dec=args.pair_max_carrier_pairs_dec,
             pair_max_bridges_enc=args.pair_max_bridges_enc,
             pair_max_bridges_dec=args.pair_max_bridges_dec,
+            pair_topk=args.pair_topk,
         )  # Explanation: computes an intermediate value for molecular graph editing
         if isinstance(current_graph_tensors, GraphBatch):
             edit_labels = prepare_contextual_edit_labels(

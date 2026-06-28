@@ -7,6 +7,19 @@ import torch
 from rdkit import Chem
 
 from kgcl_retro.chemistry.contextual_fg import INF_DISTANCE, MoleculeFGMetadata
+from kgcl_retro.chemistry.features import BOND_FDIM, BOND_TYPES, get_bond_features
+
+
+PAIR_RELATION_FEATURE_SIZE = 32
+
+
+@dataclass
+class ProposalPairMetadata:
+    unordered_pairs: torch.LongTensor
+    pair_relation_features: torch.FloatTensor
+    pair_relation_codes: torch.LongTensor
+    atom_scope: list[tuple[int, int]]
+    diagnostics: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -26,6 +39,18 @@ class SparsePairMetadata:
     unordered_dec_candidate_pairs: torch.LongTensor
     action_pair_scope: list[tuple[int, int]]
     atom_scope: list[tuple[int, int]]
+    pair_relation_features: torch.FloatTensor = field(
+        default_factory=lambda: torch.zeros((0, PAIR_RELATION_FEATURE_SIZE), dtype=torch.float32)
+    )
+    dec_pair_relation_features: torch.FloatTensor = field(
+        default_factory=lambda: torch.zeros((0, PAIR_RELATION_FEATURE_SIZE), dtype=torch.float32)
+    )
+    proposal_universe_pairs: torch.LongTensor = field(default_factory=lambda: torch.zeros((0, 2), dtype=torch.long))
+    proposal_pair_relation_features: torch.FloatTensor = field(
+        default_factory=lambda: torch.zeros((0, PAIR_RELATION_FEATURE_SIZE), dtype=torch.float32)
+    )
+    proposal_pair_relation_codes: torch.LongTensor = field(default_factory=lambda: torch.zeros((0,), dtype=torch.long))
+    proposal_pair_scope: list[tuple[int, int]] = field(default_factory=list)
     gold_bond_pairs: torch.LongTensor = field(default_factory=lambda: torch.zeros((0, 2), dtype=torch.long))
     gold_atom_indices: torch.LongTensor = field(default_factory=lambda: torch.zeros((0,), dtype=torch.long))
     action_vector_lengths: list[int] = field(default_factory=list)
@@ -37,6 +62,12 @@ def _to_tensor(pairs: Iterable[tuple[int, int]]) -> torch.LongTensor:
     if not ordered:
         return torch.zeros((0, 2), dtype=torch.long)
     return torch.tensor(ordered, dtype=torch.long)
+
+
+def _feature_tensor(features: list[list[float]]) -> torch.FloatTensor:
+    if not features:
+        return torch.zeros((0, PAIR_RELATION_FEATURE_SIZE), dtype=torch.float32)
+    return torch.tensor(features, dtype=torch.float32)
 
 
 def _distances(mol: Chem.Mol) -> list[list[int]]:
@@ -69,16 +100,120 @@ def _relation_code(mol: Chem.Mol, i_abs: int, j_abs: int, atom_offset: int) -> i
     return 1 if mol.GetBondBetweenAtoms(i, j) is not None else 2
 
 
-def _fg_context_pairs(fg_metadata: MoleculeFGMetadata, atom_offset: int) -> set[tuple[int, int]]:
-    pairs: set[tuple[int, int]] = set()
+def _fg_context_sets(fg_metadata: MoleculeFGMetadata, atom_offset: int) -> list[set[int]]:
+    contexts = []
     for instance in fg_metadata.instances:
         if instance.is_null:
             continue
-        atoms = [atom_offset + atom_idx for atom_idx in instance.context_atom_indices]
-        for i in atoms:
-            for j in atoms:
+        contexts.append({atom_offset + atom_idx for atom_idx in instance.context_atom_indices})
+    return contexts
+
+
+def _fg_context_pairs(fg_metadata: MoleculeFGMetadata, atom_offset: int) -> set[tuple[int, int]]:
+    pairs: set[tuple[int, int]] = set()
+    for context in _fg_context_sets(fg_metadata, atom_offset):
+        for i in context:
+            for j in context:
                 pairs.add((i, j))
     return pairs
+
+
+def _same_ring(mol: Chem.Mol, i: int, j: int) -> bool:
+    if i == j:
+        return True
+    return any(i in ring and j in ring for ring in mol.GetRingInfo().AtomRings())
+
+
+def _same_aromatic_system(mol: Chem.Mol, i: int, j: int) -> bool:
+    if i == j:
+        return mol.GetAtomWithIdx(i).GetIsAromatic()
+    return any(
+        i in ring
+        and j in ring
+        and all(mol.GetAtomWithIdx(atom_idx).GetIsAromatic() for atom_idx in ring)
+        for ring in mol.GetRingInfo().AtomRings()
+    )
+
+
+def _fg_counts(fg_contexts: list[set[int]], i_abs: int, j_abs: int) -> tuple[float, float]:
+    any_count = 0
+    co_count = 0
+    for context in fg_contexts:
+        has_i = i_abs in context
+        has_j = j_abs in context
+        if has_i or has_j:
+            any_count += 1
+        if has_i and has_j:
+            co_count += 1
+    normalizer = float(max(len(fg_contexts), 1))
+    return any_count / normalizer, co_count / normalizer
+
+
+def _distance_bucket(distance: int) -> int:
+    if distance == INF_DISTANCE:
+        return 4
+    return min(distance, 4)
+
+
+def _bond_type_one_hot(bond: Chem.Bond | None) -> list[float]:
+    if bond is None:
+        return [0.0] * len(BOND_TYPES)
+    return [float(bond.GetBondType() == bond_type) for bond_type in BOND_TYPES]
+
+
+def _relation_feature(
+    mol: Chem.Mol,
+    fg_contexts: list[set[int]],
+    distances: list[list[int]],
+    i_abs: int,
+    j_abs: int,
+    atom_offset: int,
+) -> list[float]:
+    i = i_abs - atom_offset
+    j = j_abs - atom_offset
+    relation_code = _relation_code(mol, i_abs, j_abs, atom_offset)
+    bond = None if i == j else mol.GetBondBetweenAtoms(i, j)
+    distance = distances[i][j]
+    bucket = _distance_bucket(distance)
+    distance_one_hot = [float(bucket == idx) for idx in range(5)]
+    fg_any, fg_co = _fg_counts(fg_contexts, i_abs, j_abs)
+    raw_bond = get_bond_features(bond) if bond is not None else [0.0] * BOND_FDIM
+    raw_bond = (raw_bond + [0.0] * BOND_FDIM)[:BOND_FDIM]
+    features = [
+        float(relation_code == 0),
+        float(relation_code == 1),
+        float(relation_code == 2),
+        float(distance == INF_DISTANCE),
+        *distance_one_hot,
+        float(_same_ring(mol, i, j)),
+        float(fg_co > 0.0),
+        float(_same_aromatic_system(mol, i, j)),
+        *_bond_type_one_hot(bond),
+        *raw_bond,
+        fg_any,
+        fg_co,
+        float(i_abs < j_abs),
+        1.0,
+    ]
+    if len(features) > PAIR_RELATION_FEATURE_SIZE:
+        return features[:PAIR_RELATION_FEATURE_SIZE]
+    return features + [0.0] * (PAIR_RELATION_FEATURE_SIZE - len(features))
+
+
+def _relation_tensors(
+    mol: Chem.Mol,
+    fg_metadata: MoleculeFGMetadata,
+    pairs: torch.LongTensor,
+    atom_offset: int,
+) -> tuple[torch.LongTensor, torch.FloatTensor]:
+    distances = _distances(mol)
+    fg_contexts = _fg_context_sets(fg_metadata, atom_offset)
+    codes = []
+    features = []
+    for i_abs, j_abs in pairs.tolist():
+        codes.append(_relation_code(mol, int(i_abs), int(j_abs), atom_offset))
+        features.append(_relation_feature(mol, fg_contexts, distances, int(i_abs), int(j_abs), atom_offset))
+    return torch.tensor(codes, dtype=torch.long), _feature_tensor(features)
 
 
 def _score_pairs(
@@ -101,22 +236,45 @@ def _score_pairs(
             if distances[i][j] <= pair_near_radius:
                 pairs.add((atom_offset + i, atom_offset + j))
     pairs.update(_fg_context_pairs(fg_metadata, atom_offset))
-    pairs.update((j, i) for i, j in list(pairs))
+    return _cap_reversal_closed(pairs, max_score_pairs, _required_pairs(mol, atom_offset))
 
-    if len(pairs) <= max_score_pairs:
-        return pairs
-    diagonals = {(atom_offset + i, atom_offset + i) for i in range(n_atoms)}
-    required = set(diagonals)
+
+def _required_pairs(mol: Chem.Mol, atom_offset: int) -> set[tuple[int, int]]:
+    required = {(atom_offset + i, atom_offset + i) for i in range(mol.GetNumAtoms())}
     for bond in mol.GetBonds():
         i = atom_offset + bond.GetBeginAtomIdx()
         j = atom_offset + bond.GetEndAtomIdx()
         required.add((i, j))
         required.add((j, i))
-    optional = sorted(pairs - required)
+    return required
+
+
+def _with_reversals(pairs: Iterable[tuple[int, int]]) -> set[tuple[int, int]]:
+    closed = set(pairs)
+    closed.update((j, i) for i, j in list(closed))
+    return closed
+
+
+def _cap_reversal_closed(
+    pairs: set[tuple[int, int]],
+    max_pairs: int,
+    required: set[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    pairs = _with_reversals(pairs)
+    required = _with_reversals(required)
+    if len(pairs) <= max_pairs:
+        return pairs
     capped = set(required)
-    capped.update(optional[: max(0, max_score_pairs - len(required))])
-    capped.update((j, i) for i, j in list(capped))
+    for pair in sorted(pairs - required):
+        reverse = (pair[1], pair[0])
+        addition = {pair, reverse}
+        if len(capped | addition) <= max_pairs:
+            capped.update(addition)
     return capped
+
+
+def _normalize_unordered_pairs(pairs: Iterable[tuple[int, int]]) -> set[tuple[int, int]]:
+    return {tuple(sorted((int(i), int(j)))) for i, j in pairs if int(i) != int(j)}
 
 
 def _bridge_atoms(
@@ -127,6 +285,7 @@ def _bridge_atoms(
     atom_offset: int,
     pair_bridge_radius: int,
     max_bridges: int,
+    proposal_pairs: set[tuple[int, int]] | None = None,
 ) -> list[int]:
     distances = _distances(mol)
     i = i_abs - atom_offset
@@ -141,11 +300,16 @@ def _bridge_atoms(
         context = {atom_offset + atom_idx for atom_idx in instance.context_atom_indices}
         if i_abs in context or j_abs in context:
             bridge_atoms.update(context)
+    proposal_pairs = proposal_pairs or set()
+    for u_abs in range(atom_offset, atom_offset + mol.GetNumAtoms()):
+        if tuple(sorted((i_abs, u_abs))) in proposal_pairs or tuple(sorted((u_abs, j_abs))) in proposal_pairs:
+            bridge_atoms.add(u_abs)
 
     def rank(atom_abs: int) -> tuple[int, int, int]:
         u = atom_abs - atom_offset
         shortest_gap = abs((distances[i][u] + distances[u][j]) - distances[i][j])
-        return (shortest_gap, distances[i][u] + distances[u][j], atom_abs)
+        proposal_bonus = 0 if tuple(sorted((i_abs, atom_abs))) in proposal_pairs else 1
+        return (proposal_bonus, shortest_gap, distances[i][u] + distances[u][j], atom_abs)
 
     return sorted(bridge_atoms, key=rank)[:max_bridges]
 
@@ -158,25 +322,15 @@ def _carrier_pairs(
     pair_bridge_radius: int,
     max_carrier_pairs: int,
     max_bridges: int,
+    proposal_pairs: set[tuple[int, int]] | None = None,
 ) -> set[tuple[int, int]]:
     carrier = set(score_pairs)
     for i, j in sorted(score_pairs):
-        for u in _bridge_atoms(mol, fg_metadata, i, j, atom_offset, pair_bridge_radius, max_bridges):
+        for u in _bridge_atoms(
+            mol, fg_metadata, i, j, atom_offset, pair_bridge_radius, max_bridges, proposal_pairs=proposal_pairs
+        ):
             carrier.update({(i, u), (u, i), (u, j), (j, u)})
-    carrier.update((j, i) for i, j in list(carrier))
-    if len(carrier) <= max_carrier_pairs:
-        return carrier
-
-    non_score = sorted(carrier - score_pairs)
-    capped = set(score_pairs)
-    for pair in non_score:
-        if len(capped) >= max_carrier_pairs:
-            break
-        reverse = (pair[1], pair[0])
-        if len(capped) + (0 if reverse in capped or reverse == pair else 1) + 1 <= max_carrier_pairs:
-            capped.add(pair)
-            capped.add(reverse)
-    return capped
+    return _cap_reversal_closed(carrier, max_carrier_pairs, score_pairs)
 
 
 def _bridge_tensors(
@@ -186,12 +340,22 @@ def _bridge_tensors(
     atom_offset: int,
     pair_bridge_radius: int,
     max_bridges: int,
+    proposal_pairs: set[tuple[int, int]] | None = None,
 ) -> tuple[torch.LongTensor, torch.BoolTensor]:
     rows: list[list[int]] = []
     masks: list[list[bool]] = []
     carrier = set(carrier_pairs)
     for i, j in sorted(carrier_pairs):
-        candidates = _bridge_atoms(mol, fg_metadata, i, j, atom_offset, pair_bridge_radius, max_bridges * 2)
+        candidates = _bridge_atoms(
+            mol,
+            fg_metadata,
+            i,
+            j,
+            atom_offset,
+            pair_bridge_radius,
+            max_bridges * 2,
+            proposal_pairs=proposal_pairs,
+        )
         closed = [u for u in candidates if (i, u) in carrier and (u, j) in carrier][:max_bridges]
         padded = closed + [0] * (max_bridges - len(closed))
         rows.append(padded)
@@ -202,10 +366,177 @@ def _bridge_tensors(
 
 
 def _unordered_candidates(dec_score_pairs: set[tuple[int, int]]) -> torch.LongTensor:
-    unordered = sorted({tuple(sorted((i, j))) for i, j in dec_score_pairs if i != j})
-    if not unordered:
-        return torch.zeros((0, 2), dtype=torch.long)
-    return torch.tensor(unordered, dtype=torch.long)
+    return _to_tensor(_normalize_unordered_pairs(dec_score_pairs))
+
+
+def _avg_bridge_count(mask: torch.BoolTensor) -> float:
+    return float(mask.float().sum(dim=1).mean().item()) if mask.numel() else 0.0
+
+
+def build_encoder_pair_metadata(
+    mol: Chem.Mol,
+    fg_metadata: MoleculeFGMetadata,
+    atom_offset: int = 1,
+    pair_near_radius: int = 2,
+    pair_bridge_radius: int = 2,
+    pair_max_score_pairs_enc: int = 512,
+    pair_max_carrier_pairs_enc: int = 1024,
+    pair_max_bridges_enc: int = 8,
+) -> SparsePairMetadata:
+    enc_score = _score_pairs(mol, fg_metadata, atom_offset, pair_near_radius, pair_max_score_pairs_enc)
+    enc_carrier = _carrier_pairs(
+        mol, fg_metadata, enc_score, atom_offset, pair_bridge_radius, pair_max_carrier_pairs_enc, pair_max_bridges_enc
+    )
+    enc_bridge_index, enc_bridge_mask = _bridge_tensors(
+        mol, fg_metadata, enc_carrier, atom_offset, pair_bridge_radius, pair_max_bridges_enc
+    )
+    enc_carrier_tensor = _to_tensor(enc_carrier)
+    relation_codes, relation_features = _relation_tensors(mol, fg_metadata, enc_carrier_tensor, atom_offset)
+    empty_pairs = torch.zeros((0, 2), dtype=torch.long)
+    empty_bridge = torch.zeros((0, pair_max_bridges_enc), dtype=torch.long)
+    empty_mask = torch.zeros((0, pair_max_bridges_enc), dtype=torch.bool)
+    diagnostics = {
+        "num_enc_score": len(enc_score),
+        "num_enc_plus": len(enc_carrier),
+        "avg_K_ij_enc": _avg_bridge_count(enc_bridge_mask),
+        "fraction_enc_nonempty_bridge": float(enc_bridge_mask.any(dim=1).float().mean().item()) if enc_bridge_mask.numel() else 0.0,
+    }
+    return SparsePairMetadata(
+        enc_score_pairs=_to_tensor(enc_score),
+        dec_score_pairs_base=empty_pairs,
+        enc_carrier_pairs=enc_carrier_tensor,
+        dec_carrier_pairs_base=empty_pairs,
+        enc_pair_scope=[(0, len(enc_carrier))],
+        dec_pair_scope=[(0, 0)],
+        enc_bridge_index=enc_bridge_index,
+        enc_bridge_mask=enc_bridge_mask,
+        dec_bridge_index_base=empty_bridge,
+        dec_bridge_mask_base=empty_mask,
+        pair_relation_codes=relation_codes,
+        dec_pair_relation_codes=torch.zeros((0,), dtype=torch.long),
+        unordered_dec_candidate_pairs=empty_pairs,
+        action_pair_scope=[(0, 0)],
+        atom_scope=[(atom_offset, mol.GetNumAtoms())],
+        pair_relation_features=relation_features,
+        diagnostics=diagnostics,
+    )
+
+
+def build_proposal_universe(
+    mol: Chem.Mol,
+    fg_metadata: MoleculeFGMetadata,
+    atom_offset: int = 1,
+    pair_near_radius: int = 2,
+    pair_max_pairs: int = 2048,
+    tiny_mol_all_pairs_cutoff: int = 16,
+) -> ProposalPairMetadata:
+    n_atoms = mol.GetNumAtoms()
+    distances = _distances(mol)
+    unordered: set[tuple[int, int]] = set()
+    for bond in mol.GetBonds():
+        unordered.add(tuple(sorted((atom_offset + bond.GetBeginAtomIdx(), atom_offset + bond.GetEndAtomIdx()))))
+    for i in range(n_atoms):
+        for j in range(i + 1, n_atoms):
+            if distances[i][j] <= pair_near_radius:
+                unordered.add((atom_offset + i, atom_offset + j))
+    for i, j in _fg_context_pairs(fg_metadata, atom_offset):
+        if i != j:
+            unordered.add(tuple(sorted((i, j))))
+    if n_atoms <= tiny_mol_all_pairs_cutoff:
+        for i in range(n_atoms):
+            for j in range(i + 1, n_atoms):
+                unordered.add((atom_offset + i, atom_offset + j))
+    ordered = sorted(unordered)[:pair_max_pairs]
+    pair_tensor = _to_tensor(ordered)
+    relation_codes, relation_features = _relation_tensors(mol, fg_metadata, pair_tensor, atom_offset)
+    return ProposalPairMetadata(
+        unordered_pairs=pair_tensor,
+        pair_relation_features=relation_features,
+        pair_relation_codes=relation_codes,
+        atom_scope=[(atom_offset, n_atoms)],
+        diagnostics={"num_proposal_universe": len(ordered)},
+    )
+
+
+def build_decoder_pair_metadata(
+    mol: Chem.Mol,
+    fg_metadata: MoleculeFGMetadata,
+    enc_score_pairs: Iterable[tuple[int, int]],
+    proposal_topk_pairs: Iterable[tuple[int, int]],
+    gold_bond_pairs: Iterable[tuple[int, int]] | None = None,
+    training: bool = False,
+    atom_offset: int = 1,
+    pair_near_radius: int = 2,
+    pair_bridge_radius: int = 2,
+    pair_max_score_pairs_dec: int = 1024,
+    pair_max_carrier_pairs_dec: int = 2048,
+    pair_max_bridges_dec: int = 8,
+) -> SparsePairMetadata:
+    del pair_near_radius
+    enc_score = set(enc_score_pairs)
+    proposal_unordered = _normalize_unordered_pairs(proposal_topk_pairs)
+    proposal_directed = _with_reversals(proposal_unordered)
+    gold_unordered = _normalize_unordered_pairs(gold_bond_pairs or [])
+    score_pairs = set(enc_score)
+    score_pairs.update(proposal_directed)
+    if training:
+        score_pairs.update(_with_reversals(gold_unordered))
+    required = _required_pairs(mol, atom_offset)
+    required.update(enc_score)
+    score_pairs = _cap_reversal_closed(score_pairs, pair_max_score_pairs_dec, required)
+    carrier = _carrier_pairs(
+        mol,
+        fg_metadata,
+        score_pairs,
+        atom_offset,
+        pair_bridge_radius,
+        pair_max_carrier_pairs_dec,
+        pair_max_bridges_dec,
+        proposal_pairs=proposal_unordered,
+    )
+    bridge_index, bridge_mask = _bridge_tensors(
+        mol,
+        fg_metadata,
+        carrier,
+        atom_offset,
+        pair_bridge_radius,
+        pair_max_bridges_dec,
+        proposal_pairs=proposal_unordered,
+    )
+    carrier_tensor = _to_tensor(carrier)
+    relation_codes, relation_features = _relation_tensors(mol, fg_metadata, carrier_tensor, atom_offset)
+    action_pairs = _unordered_candidates(score_pairs)
+    inference_candidates = _normalize_unordered_pairs(enc_score) | proposal_unordered
+    rescued = gold_unordered - inference_candidates if training else set()
+    absent_in_inference = gold_unordered - inference_candidates
+    diagnostics = {
+        "num_dec_score": len(score_pairs),
+        "num_dec_plus": len(carrier),
+        "avg_K_ij_dec": _avg_bridge_count(bridge_mask),
+        "fraction_dec_nonempty_bridge": float(bridge_mask.any(dim=1).float().mean().item()) if bridge_mask.numel() else 0.0,
+        "gold_pairs_absent_from_inference": len(absent_in_inference),
+        "gold_pairs_rescued_by_teacher_forcing": len(rescued),
+    }
+    empty_pairs = torch.zeros((0, 2), dtype=torch.long)
+    return SparsePairMetadata(
+        enc_score_pairs=empty_pairs,
+        dec_score_pairs_base=_to_tensor(score_pairs),
+        enc_carrier_pairs=empty_pairs,
+        dec_carrier_pairs_base=carrier_tensor,
+        enc_pair_scope=[(0, 0)],
+        dec_pair_scope=[(0, len(carrier))],
+        enc_bridge_index=torch.zeros((0, pair_max_bridges_dec), dtype=torch.long),
+        enc_bridge_mask=torch.zeros((0, pair_max_bridges_dec), dtype=torch.bool),
+        dec_bridge_index_base=bridge_index,
+        dec_bridge_mask_base=bridge_mask,
+        pair_relation_codes=torch.zeros((0,), dtype=torch.long),
+        dec_pair_relation_codes=relation_codes,
+        unordered_dec_candidate_pairs=action_pairs,
+        action_pair_scope=[(0, int(action_pairs.size(0)))],
+        atom_scope=[(atom_offset, mol.GetNumAtoms())],
+        dec_pair_relation_features=relation_features,
+        diagnostics=diagnostics,
+    )
 
 
 def build_sparse_pair_metadata(
@@ -220,59 +551,108 @@ def build_sparse_pair_metadata(
     pair_max_carrier_pairs_dec: int = 2048,
     pair_max_bridges_enc: int = 8,
     pair_max_bridges_dec: int = 8,
+    pair_topk: int = 64,
 ) -> SparsePairMetadata:
-    enc_score = _score_pairs(mol, fg_metadata, atom_offset, pair_near_radius, pair_max_score_pairs_enc)
-    dec_score = _score_pairs(mol, fg_metadata, atom_offset, pair_near_radius, pair_max_score_pairs_dec)
-    enc_carrier = _carrier_pairs(
-        mol, fg_metadata, enc_score, atom_offset, pair_bridge_radius, pair_max_carrier_pairs_enc, pair_max_bridges_enc
+    encoder = build_encoder_pair_metadata(
+        mol,
+        fg_metadata,
+        atom_offset=atom_offset,
+        pair_near_radius=pair_near_radius,
+        pair_bridge_radius=pair_bridge_radius,
+        pair_max_score_pairs_enc=pair_max_score_pairs_enc,
+        pair_max_carrier_pairs_enc=pair_max_carrier_pairs_enc,
+        pair_max_bridges_enc=pair_max_bridges_enc,
     )
-    dec_carrier = _carrier_pairs(
-        mol, fg_metadata, dec_score, atom_offset, pair_bridge_radius, pair_max_carrier_pairs_dec, pair_max_bridges_dec
+    proposal = build_proposal_universe(
+        mol,
+        fg_metadata,
+        atom_offset=atom_offset,
+        pair_near_radius=pair_near_radius,
+        pair_max_pairs=max(pair_topk, pair_max_score_pairs_dec),
     )
-    enc_bridge_index, enc_bridge_mask = _bridge_tensors(
-        mol, fg_metadata, enc_carrier, atom_offset, pair_bridge_radius, pair_max_bridges_enc
+    decoder = build_decoder_pair_metadata(
+        mol,
+        fg_metadata,
+        enc_score_pairs=set(map(tuple, encoder.enc_score_pairs.tolist())),
+        proposal_topk_pairs=set(),
+        atom_offset=atom_offset,
+        pair_bridge_radius=pair_bridge_radius,
+        pair_max_score_pairs_dec=pair_max_score_pairs_dec,
+        pair_max_carrier_pairs_dec=pair_max_carrier_pairs_dec,
+        pair_max_bridges_dec=pair_max_bridges_dec,
+        training=False,
     )
-    dec_bridge_index, dec_bridge_mask = _bridge_tensors(
-        mol, fg_metadata, dec_carrier, atom_offset, pair_bridge_radius, pair_max_bridges_dec
-    )
-    enc_carrier_tensor = _to_tensor(enc_carrier)
-    dec_carrier_tensor = _to_tensor(dec_carrier)
-    relation_codes = torch.tensor(
-        [_relation_code(mol, int(i), int(j), atom_offset) for i, j in enc_carrier_tensor.tolist()],
-        dtype=torch.long,
-    )
-    dec_relation_codes = torch.tensor(
-        [_relation_code(mol, int(i), int(j), atom_offset) for i, j in dec_carrier_tensor.tolist()],
-        dtype=torch.long,
-    )
-    diagnostics = {
-        "num_enc_score": len(enc_score),
-        "num_enc_plus": len(enc_carrier),
-        "num_dec_score": len(dec_score),
-        "num_dec_plus": len(dec_carrier),
-        "fraction_enc_nonempty_bridge": float(enc_bridge_mask.any(dim=1).float().mean().item()) if enc_bridge_mask.numel() else 0.0,
-        "fraction_dec_nonempty_bridge": float(dec_bridge_mask.any(dim=1).float().mean().item()) if dec_bridge_mask.numel() else 0.0,
+    encoder.dec_score_pairs_base = decoder.dec_score_pairs_base
+    encoder.dec_carrier_pairs_base = decoder.dec_carrier_pairs_base
+    encoder.dec_pair_scope = decoder.dec_pair_scope
+    encoder.dec_bridge_index_base = decoder.dec_bridge_index_base
+    encoder.dec_bridge_mask_base = decoder.dec_bridge_mask_base
+    encoder.dec_pair_relation_codes = decoder.dec_pair_relation_codes
+    encoder.dec_pair_relation_features = decoder.dec_pair_relation_features
+    encoder.unordered_dec_candidate_pairs = decoder.unordered_dec_candidate_pairs
+    encoder.action_pair_scope = decoder.action_pair_scope
+    encoder.proposal_universe_pairs = proposal.unordered_pairs
+    encoder.proposal_pair_relation_features = proposal.pair_relation_features
+    encoder.proposal_pair_relation_codes = proposal.pair_relation_codes
+    encoder.proposal_pair_scope = [(0, int(proposal.unordered_pairs.size(0)))]
+    encoder.diagnostics = {**encoder.diagnostics, **proposal.diagnostics, **decoder.diagnostics}
+    return encoder
+
+
+def merge_decoder_pair_metadata(items: list[SparsePairMetadata]) -> dict:
+    dec_pair_scope: list[tuple[int, int]] = []
+    action_pair_scope: list[tuple[int, int]] = []
+    dec_cursor = action_cursor = 0
+    for item in items:
+        dec_count = int(item.dec_carrier_pairs_base.size(0))
+        action_count = int(item.unordered_dec_candidate_pairs.size(0))
+        dec_pair_scope.append((dec_cursor, dec_count))
+        action_pair_scope.append((action_cursor, action_count))
+        dec_cursor += dec_count
+        action_cursor += action_count
+    empty_pairs = torch.zeros((0, 2), dtype=torch.long)
+    empty_features = torch.zeros((0, PAIR_RELATION_FEATURE_SIZE), dtype=torch.float32)
+    diagnostics = {}
+    if items:
+        diagnostics = {
+            "avg_dec_score": sum(item.diagnostics.get("num_dec_score", 0) for item in items) / len(items),
+            "avg_dec_plus": sum(item.diagnostics.get("num_dec_plus", 0) for item in items) / len(items),
+            "avg_K_ij_dec": sum(item.diagnostics.get("avg_K_ij_dec", 0.0) for item in items) / len(items),
+            "fraction_dec_nonempty_bridge": sum(
+                item.diagnostics.get("fraction_dec_nonempty_bridge", 0.0) for item in items
+            )
+            / len(items),
+            "gold_pairs_absent_from_inference": sum(
+                item.diagnostics.get("gold_pairs_absent_from_inference", 0) for item in items
+            ),
+            "gold_pairs_rescued_by_teacher_forcing": sum(
+                item.diagnostics.get("gold_pairs_rescued_by_teacher_forcing", 0) for item in items
+            ),
+        }
+    return {
+        "dec_score_pairs_base": torch.cat([item.dec_score_pairs_base for item in items], dim=0) if items else empty_pairs,
+        "dec_carrier_pairs_base": torch.cat([item.dec_carrier_pairs_base for item in items], dim=0)
+        if items
+        else empty_pairs,
+        "dec_pair_scope": dec_pair_scope,
+        "dec_bridge_index_base": torch.cat([item.dec_bridge_index_base for item in items], dim=0)
+        if items
+        else torch.zeros((0, 0), dtype=torch.long),
+        "dec_bridge_mask_base": torch.cat([item.dec_bridge_mask_base for item in items], dim=0)
+        if items
+        else torch.zeros((0, 0), dtype=torch.bool),
+        "dec_pair_relation_codes": torch.cat([item.dec_pair_relation_codes for item in items], dim=0)
+        if items
+        else torch.zeros((0,), dtype=torch.long),
+        "dec_pair_relation_features": torch.cat([item.dec_pair_relation_features for item in items], dim=0)
+        if items
+        else empty_features,
+        "unordered_dec_candidate_pairs": torch.cat([item.unordered_dec_candidate_pairs for item in items], dim=0)
+        if items
+        else empty_pairs,
+        "action_pair_scope": action_pair_scope,
+        "diagnostics": diagnostics,
     }
-    action_pairs = _unordered_candidates(dec_score)
-    return SparsePairMetadata(
-        enc_score_pairs=_to_tensor(enc_score),
-        dec_score_pairs_base=_to_tensor(dec_score),
-        enc_carrier_pairs=enc_carrier_tensor,
-        dec_carrier_pairs_base=dec_carrier_tensor,
-        enc_pair_scope=[(0, len(enc_carrier))],
-        dec_pair_scope=[(0, len(dec_carrier))],
-        enc_bridge_index=enc_bridge_index,
-        enc_bridge_mask=enc_bridge_mask,
-        dec_bridge_index_base=dec_bridge_index,
-        dec_bridge_mask_base=dec_bridge_mask,
-        pair_relation_codes=relation_codes,
-        dec_pair_relation_codes=dec_relation_codes,
-        unordered_dec_candidate_pairs=action_pairs,
-        action_pair_scope=[(0, int(action_pairs.size(0)))],
-        atom_scope=[(atom_offset, mol.GetNumAtoms())],
-        action_vector_lengths=[],
-        diagnostics=diagnostics,
-    )
 
 
 def merge_sparse_pair_metadata(items: list[SparsePairMetadata]) -> SparsePairMetadata:
@@ -280,47 +660,76 @@ def merge_sparse_pair_metadata(items: list[SparsePairMetadata]) -> SparsePairMet
         empty_pairs = torch.zeros((0, 2), dtype=torch.long)
         empty_bridge = torch.zeros((0, 0), dtype=torch.long)
         empty_mask = torch.zeros((0, 0), dtype=torch.bool)
+        empty_features = torch.zeros((0, PAIR_RELATION_FEATURE_SIZE), dtype=torch.float32)
         return SparsePairMetadata(
-            empty_pairs, empty_pairs, empty_pairs, empty_pairs, [], [], empty_bridge, empty_mask,
-            empty_bridge, empty_mask, torch.zeros((0,), dtype=torch.long),
-            torch.zeros((0,), dtype=torch.long), empty_pairs, [], []
+            enc_score_pairs=empty_pairs,
+            dec_score_pairs_base=empty_pairs,
+            enc_carrier_pairs=empty_pairs,
+            dec_carrier_pairs_base=empty_pairs,
+            enc_pair_scope=[],
+            dec_pair_scope=[],
+            enc_bridge_index=empty_bridge,
+            enc_bridge_mask=empty_mask,
+            dec_bridge_index_base=empty_bridge,
+            dec_bridge_mask_base=empty_mask,
+            pair_relation_codes=torch.zeros((0,), dtype=torch.long),
+            dec_pair_relation_codes=torch.zeros((0,), dtype=torch.long),
+            unordered_dec_candidate_pairs=empty_pairs,
+            action_pair_scope=[],
+            atom_scope=[],
+            pair_relation_features=empty_features,
+            dec_pair_relation_features=empty_features,
+            proposal_pair_relation_features=empty_features,
+            diagnostics={},
         )
 
     enc_pair_scope: list[tuple[int, int]] = []
-    dec_pair_scope: list[tuple[int, int]] = []
-    action_pair_scope: list[tuple[int, int]] = []
     atom_scope: list[tuple[int, int]] = []
-    enc_cursor = dec_cursor = action_cursor = 0
+    proposal_pair_scope: list[tuple[int, int]] = []
+    enc_cursor = proposal_cursor = 0
     for item in items:
         enc_pair_scope.append((enc_cursor, int(item.enc_carrier_pairs.size(0))))
-        dec_pair_scope.append((dec_cursor, int(item.dec_carrier_pairs_base.size(0))))
-        action_pair_scope.append((action_cursor, int(item.unordered_dec_candidate_pairs.size(0))))
+        proposal_pair_scope.append((proposal_cursor, int(item.proposal_universe_pairs.size(0))))
         atom_scope.extend(item.atom_scope)
         enc_cursor += int(item.enc_carrier_pairs.size(0))
-        dec_cursor += int(item.dec_carrier_pairs_base.size(0))
-        action_cursor += int(item.unordered_dec_candidate_pairs.size(0))
+        proposal_cursor += int(item.proposal_universe_pairs.size(0))
 
+    decoder = merge_decoder_pair_metadata(items)
     diagnostics = {
         "avg_enc_score": sum(item.diagnostics.get("num_enc_score", 0) for item in items) / len(items),
         "avg_enc_plus": sum(item.diagnostics.get("num_enc_plus", 0) for item in items) / len(items),
-        "avg_dec_score": sum(item.diagnostics.get("num_dec_score", 0) for item in items) / len(items),
-        "avg_dec_plus": sum(item.diagnostics.get("num_dec_plus", 0) for item in items) / len(items),
+        "avg_K_ij_enc": sum(item.diagnostics.get("avg_K_ij_enc", 0.0) for item in items) / len(items),
+        "fraction_enc_nonempty_bridge": sum(
+            item.diagnostics.get("fraction_enc_nonempty_bridge", 0.0) for item in items
+        )
+        / len(items),
+        "avg_dec_score": decoder["diagnostics"].get("avg_dec_score", 0.0),
+        "avg_dec_plus": decoder["diagnostics"].get("avg_dec_plus", 0.0),
+        "avg_K_ij_dec": decoder["diagnostics"].get("avg_K_ij_dec", 0.0),
+        "fraction_dec_nonempty_bridge": decoder["diagnostics"].get("fraction_dec_nonempty_bridge", 0.0),
+        "avg_proposal_universe": sum(item.diagnostics.get("num_proposal_universe", 0) for item in items) / len(items),
     }
     return SparsePairMetadata(
         enc_score_pairs=torch.cat([item.enc_score_pairs for item in items], dim=0),
-        dec_score_pairs_base=torch.cat([item.dec_score_pairs_base for item in items], dim=0),
+        dec_score_pairs_base=decoder["dec_score_pairs_base"],
         enc_carrier_pairs=torch.cat([item.enc_carrier_pairs for item in items], dim=0),
-        dec_carrier_pairs_base=torch.cat([item.dec_carrier_pairs_base for item in items], dim=0),
+        dec_carrier_pairs_base=decoder["dec_carrier_pairs_base"],
         enc_pair_scope=enc_pair_scope,
-        dec_pair_scope=dec_pair_scope,
+        dec_pair_scope=decoder["dec_pair_scope"],
         enc_bridge_index=torch.cat([item.enc_bridge_index for item in items], dim=0),
         enc_bridge_mask=torch.cat([item.enc_bridge_mask for item in items], dim=0),
-        dec_bridge_index_base=torch.cat([item.dec_bridge_index_base for item in items], dim=0),
-        dec_bridge_mask_base=torch.cat([item.dec_bridge_mask_base for item in items], dim=0),
+        dec_bridge_index_base=decoder["dec_bridge_index_base"],
+        dec_bridge_mask_base=decoder["dec_bridge_mask_base"],
         pair_relation_codes=torch.cat([item.pair_relation_codes for item in items], dim=0),
-        dec_pair_relation_codes=torch.cat([item.dec_pair_relation_codes for item in items], dim=0),
-        unordered_dec_candidate_pairs=torch.cat([item.unordered_dec_candidate_pairs for item in items], dim=0),
-        action_pair_scope=action_pair_scope,
+        dec_pair_relation_codes=decoder["dec_pair_relation_codes"],
+        unordered_dec_candidate_pairs=decoder["unordered_dec_candidate_pairs"],
+        action_pair_scope=decoder["action_pair_scope"],
         atom_scope=atom_scope,
+        pair_relation_features=torch.cat([item.pair_relation_features for item in items], dim=0),
+        dec_pair_relation_features=decoder["dec_pair_relation_features"],
+        proposal_universe_pairs=torch.cat([item.proposal_universe_pairs for item in items], dim=0),
+        proposal_pair_relation_features=torch.cat([item.proposal_pair_relation_features for item in items], dim=0),
+        proposal_pair_relation_codes=torch.cat([item.proposal_pair_relation_codes for item in items], dim=0),
+        proposal_pair_scope=proposal_pair_scope,
         diagnostics=diagnostics,
     )

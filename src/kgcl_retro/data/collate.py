@@ -2,6 +2,7 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any, List, Tuple  # Explanation: imports selected names needed to collate molecular graphs and edit labels into tensors
 import numpy as np  # Explanation: imports numpy as np for collate molecular graphs and edit labels into tensors
 import torch  # Explanation: imports torch for collate molecular graphs and edit labels into tensors
+from rdkit import Chem
 from kgcl_retro.chemistry.features import ATOM_FDIM, BOND_FDIM  # Explanation: imports packaged atom and bond feature dimensions for label tensor sizing.
 from kgcl_retro.chemistry.graphs import MolGraph  # Explanation: imports the packaged molecule graph class used by collate functions.
 from kgcl_retro.chemistry.contextual_fg import MoleculeFGMetadata
@@ -36,6 +37,7 @@ class GraphBatch:
     fg_metadata: list[MoleculeFGMetadata] | None = None
     sparse_metadata: SparsePairMetadata | None = None
     model_variant: str = "kgcl"
+    mols: list[Any] | None = None
 
     def to(self, device):
         return GraphBatch(
@@ -44,7 +46,20 @@ class GraphBatch:
             fg_metadata=self.fg_metadata,
             sparse_metadata=_move_to_device(self.sparse_metadata, device),
             model_variant=self.model_variant,
+            mols=self.mols,
         )
+
+
+@dataclass(frozen=True)
+class ContextualEditTarget:
+    edit_type: str
+    edit_class: Any
+    atom_maps: Any
+    bond_class_index: int | None = None
+    atom_class_index: int | None = None
+    gold_bond_pair: tuple[int, int] | None = None
+    gold_atom_index: int | None = None
+    stop: bool = False
 
 def create_pad_tensor(alist):  # Explanation: defines create_pad_tensor, which pads variable-length index lists
     max_len = max([len(a) for a in alist])  # Explanation: assigns an intermediate value used by later computation
@@ -97,29 +112,32 @@ def prepare_contextual_edit_labels(
     edit_atoms: List[Any],
     bond_vocab: List,
     atom_vocab: List,
-    sparse_metadata: SparsePairMetadata,
-) -> list[torch.Tensor]:
-    bond_vocab_size = bond_vocab.size()
-    atom_vocab_size = atom_vocab.size()
-    labels: list[torch.Tensor] = []
-    action_lengths: list[int] = []
+    sparse_metadata: SparsePairMetadata | None = None,
+) -> list[ContextualEditTarget]:
+    labels: list[ContextualEditTarget] = []
+    gold_bond_pairs: list[tuple[int, int]] = []
+    gold_atom_indices: list[int] = []
 
     for mol_idx, (prod_graph, edit, edit_atom) in enumerate(zip(graph_batch, edits, edit_atoms)):
-        pair_start, pair_count = sparse_metadata.action_pair_scope[mol_idx]
-        atom_start, atom_count = sparse_metadata.atom_scope[mol_idx]
-        candidate_pairs = sparse_metadata.unordered_dec_candidate_pairs[pair_start: pair_start + pair_count]
-        vector_length = pair_count * bond_vocab_size + atom_count * atom_vocab_size + 1
-        label = torch.zeros(vector_length, dtype=torch.float32)
+        atom_start = sparse_metadata.atom_scope[mol_idx][0] if sparse_metadata is not None else 0
 
         if edit == "Terminate":
-            label[-1] = 1.0
+            label = ContextualEditTarget(edit_type="stop", edit_class=edit, atom_maps=edit_atom, stop=True)
         elif edit[0] == "Change Atom" or edit[0] == "Attaching LG":
             atom_map = edit_atom
             if atom_map not in prod_graph.amap_to_idx:
                 raise ValueError(f"Gold atom map {atom_map} is not present in product graph.")
             local_atom_idx = prod_graph.amap_to_idx[atom_map]
             edit_idx = atom_vocab.get_index(edit)
-            label[pair_count * bond_vocab_size + local_atom_idx * atom_vocab_size + edit_idx] = 1.0
+            gold_atom_idx = atom_start + local_atom_idx
+            label = ContextualEditTarget(
+                edit_type="atom",
+                edit_class=edit,
+                atom_maps=edit_atom,
+                atom_class_index=edit_idx,
+                gold_atom_index=gold_atom_idx,
+            )
+            gold_atom_indices.append(gold_atom_idx)
         else:
             atom_map_1, atom_map_2 = edit_atom[0], edit_atom[1]
             if atom_map_1 not in prod_graph.amap_to_idx or atom_map_2 not in prod_graph.amap_to_idx:
@@ -132,20 +150,29 @@ def prepare_contextual_edit_labels(
                     ]
                 )
             )
-            pair_lookup = {tuple(row): idx for idx, row in enumerate(candidate_pairs.tolist())}
-            if pair not in pair_lookup:
-                raise ValueError(
-                    "Gold bond pair "
-                    f"{edit_atom} is absent from contextual_2fwl decoder candidates. "
-                    "Rebuild sparse pair metadata with broader candidate settings."
-                )
             edit_idx = bond_vocab.get_index(edit)
-            label[pair_lookup[pair] * bond_vocab_size + edit_idx] = 1.0
+            label = ContextualEditTarget(
+                edit_type="bond",
+                edit_class=edit,
+                atom_maps=edit_atom,
+                bond_class_index=edit_idx,
+                gold_bond_pair=pair,
+            )
+            gold_bond_pairs.append(pair)
 
         labels.append(label)
-        action_lengths.append(vector_length)
 
-    sparse_metadata.action_vector_lengths = action_lengths
+    if sparse_metadata is not None:
+        sparse_metadata.gold_bond_pairs = (
+            torch.tensor(gold_bond_pairs, dtype=torch.long)
+            if gold_bond_pairs
+            else torch.zeros((0, 2), dtype=torch.long)
+        )
+        sparse_metadata.gold_atom_indices = (
+            torch.tensor(gold_atom_indices, dtype=torch.long)
+            if gold_atom_indices
+            else torch.zeros((0,), dtype=torch.long)
+        )
     return labels
 
 
@@ -162,6 +189,7 @@ def get_batch_graphs(
     pair_max_carrier_pairs_dec: int = 2048,
     pair_max_bridges_enc: int = 8,
     pair_max_bridges_dec: int = 8,
+    pair_topk: int = 64,
 ) -> Tuple[torch.Tensor, List[Tuple[int]]]:  # Explanation: defines get_batch_graphs, which builds batched molecular graph tensors
     """
     Featurization of a batch of molecules.
@@ -192,6 +220,7 @@ def get_batch_graphs(
     variant = normalize_model_variant(model_variant)
     fg_metadata = []
     sparse_items = []
+    mols = []
 
     for mol_graph in graph_batch:  # Explanation: iterates over this collection to process each item
 
@@ -219,6 +248,7 @@ def get_batch_graphs(
                     "model_variant='contextual_2fwl' before contextual batching."
                 )
             fg_metadata.append(mol_graph.fg_metadata)
+            mols.append(Chem.Mol(mol_graph.mol))
             sparse_items.append(
                 build_sparse_pair_metadata(
                     mol_graph.mol,
@@ -232,6 +262,7 @@ def get_batch_graphs(
                     pair_max_carrier_pairs_dec=pair_max_carrier_pairs_dec,
                     pair_max_bridges_enc=pair_max_bridges_enc,
                     pair_max_bridges_dec=pair_max_bridges_dec,
+                    pair_topk=pair_topk,
                 )
             )
         n_atoms += mol_graph.n_atoms  # Explanation: assigns an intermediate value used by later computation
@@ -260,6 +291,7 @@ def get_batch_graphs(
             fg_metadata=fg_metadata,
             sparse_metadata=merge_sparse_pair_metadata(sparse_items),
             model_variant=variant,
+            mols=mols,
         )
 
     return graph_tensors, scopes  # Explanation: returns this computed result to the caller

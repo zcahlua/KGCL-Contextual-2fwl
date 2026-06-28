@@ -52,7 +52,7 @@ python train.py --dataset uspto_50k --model_variant contextual_2fwl
 python eval.py --dataset uspto_50k --model_variant contextual_2fwl
 ```
 
-This variant adds matched functional-group instance metadata, contextual FG attention, sparse bridge-closed ordered pair states, candidate-restricted atom/bond/stop action vectors, and candidate-pair diagnostics. Prepared data for this mode is not compatible with old baseline shards; rerun `prepare_data.py` with `--model_variant contextual_2fwl`.
+This variant adds matched functional-group instance metadata, local contextual FG graph encoding, pre-D-MPNN atom-FG attention, sparse bridge-closed ordered pair states, proposal top-K decoder expansion, dynamic gold-action target mapping, proposal BCE, candidate-restricted atom/bond/stop action vectors, and candidate-pair diagnostics. Prepared data for this mode is not compatible with old baseline shards; rerun `prepare_data.py` with `--model_variant contextual_2fwl`.
 
 The pair module is sparse, local, bridge-closed, and task-restricted. It is 2-FWL-inspired, but it is not full dense 2-FWL over all `V x V` atom pairs.
 

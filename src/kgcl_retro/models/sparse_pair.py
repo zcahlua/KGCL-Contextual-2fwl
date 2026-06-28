@@ -3,16 +3,25 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from kgcl_retro.chemistry.sparse_pair_builder import PAIR_RELATION_FEATURE_SIZE
+
 
 class PairRelationEncoder(nn.Module):
-    def __init__(self, pair_relation_size: int) -> None:
+    def __init__(self, pair_relation_size: int, feature_size: int = PAIR_RELATION_FEATURE_SIZE) -> None:
         super().__init__()
         self.relation_embedding = nn.Embedding(3, pair_relation_size)
+        self.feature_mlp = nn.Sequential(
+            nn.Linear(feature_size, pair_relation_size),
+            nn.SELU(),
+            nn.Linear(pair_relation_size, pair_relation_size),
+        )
 
-    def forward(self, relation_codes: torch.Tensor) -> torch.Tensor:
-        if relation_codes.numel() == 0:
-            return torch.zeros((0, self.relation_embedding.embedding_dim), device=relation_codes.device)
-        return self.relation_embedding(relation_codes.clamp(min=0, max=2))
+    def forward(self, relation_features: torch.Tensor) -> torch.Tensor:
+        if relation_features.numel() == 0:
+            return torch.zeros((0, self.relation_embedding.embedding_dim), device=relation_features.device)
+        if relation_features.dim() == 2:
+            return self.feature_mlp(relation_features.float())
+        return self.relation_embedding(relation_features.clamp(min=0, max=2))
 
 
 class SparsePairLayer(nn.Module):
@@ -77,20 +86,26 @@ class SparsePairLayer(nn.Module):
 
 
 class CandidateProposalHead(nn.Module):
-    def __init__(self, atom_hidden_size: int) -> None:
+    def __init__(self, atom_hidden_size: int, pair_relation_size: int, fg_pair_size: int) -> None:
         super().__init__()
         self.scorer = nn.Sequential(
-            nn.Linear(atom_hidden_size * 4, atom_hidden_size),
+            nn.Linear(atom_hidden_size * 3 + pair_relation_size + fg_pair_size, atom_hidden_size),
             nn.SELU(),
             nn.Linear(atom_hidden_size, 1),
         )
 
-    def forward(self, atom_states: torch.Tensor, unordered_pairs: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        atom_states: torch.Tensor,
+        unordered_pairs: torch.Tensor,
+        pair_rel: torch.Tensor,
+        fg_pair_context: torch.Tensor,
+    ) -> torch.Tensor:
         if unordered_pairs.numel() == 0:
             return torch.zeros((0,), dtype=atom_states.dtype, device=atom_states.device)
         left = atom_states[unordered_pairs[:, 0]]
         right = atom_states[unordered_pairs[:, 1]]
-        features = torch.cat([left + right, torch.abs(left - right), left * right, (left + right) * 0.5], dim=1)
+        features = torch.cat([left + right, torch.abs(left - right), left * right, pair_rel, fg_pair_context], dim=1)
         return self.scorer(features).squeeze(-1)
 
 

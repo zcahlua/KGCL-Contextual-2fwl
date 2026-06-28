@@ -10,7 +10,7 @@ from kgcl_retro.data.collate import (
 )
 
 
-def test_candidate_label_alignment_for_nonbonded_add_bond():
+def test_contextual_labels_store_gold_action_metadata():
     mol = Chem.MolFromSmiles("[CH3:1][CH2:2][OH:3]")
     graph = MolGraph(
         mol=mol,
@@ -31,11 +31,13 @@ def test_candidate_label_alignment_for_nonbonded_add_bond():
     )
 
     assert len(labels) == 1
-    assert labels[0].numel() == graph_batch.sparse_metadata.action_vector_lengths[0]
-    assert torch.argmax(labels[0]).item() < len(graph_batch.sparse_metadata.unordered_dec_candidate_pairs)
+    assert labels[0].edit_type == "bond"
+    assert labels[0].edit_class == ("Add Bond", (1.0, None))
+    assert labels[0].gold_bond_pair == (1, 3)
+    assert labels[0].bond_class_index == 0
 
 
-def test_contextual_labels_raise_when_gold_pair_missing():
+def test_contextual_labels_raise_when_gold_atom_missing():
     mol = Chem.MolFromSmiles("[CH3:1][OH:2]")
     graph = MolGraph(mol=mol, model_variant="contextual_2fwl", use_contextual_fg=True)
     graph_batch = get_batch_graphs([graph], model_variant="contextual_2fwl")
