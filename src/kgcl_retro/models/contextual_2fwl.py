@@ -32,6 +32,7 @@ class ContextualFGKGCL2FWL(nn.Module):
         self.hidden_size = config["mpn_size"]
         self.pair_hidden_size = config.get("pair_hidden_size", self.hidden_size)
         self.pair_relation_size = config.get("pair_relation_size", max(16, self.hidden_size // 2))
+        self.fg_hidden_size = config.get("fg_hidden_size", self.hidden_size)
 
         self.atom_feature_project = nn.Linear(config["n_atom_feat"], self.hidden_size)
         self.edge_input = nn.Linear(config["n_bond_feat"], self.hidden_size, bias=False)
@@ -43,7 +44,7 @@ class ContextualFGKGCL2FWL(nn.Module):
         )
         self.fg_encoder = ContextualFGEncoder(
             atom_hidden_size=self.hidden_size,
-            fg_hidden_size=config.get("fg_hidden_size", self.hidden_size),
+            fg_hidden_size=self.fg_hidden_size,
             fg_layers=config.get("fg_layers", 2),
             fg_use_boundary_pool=config.get("fg_use_boundary_pool", True),
             fg_use_distance_bias=config.get("fg_use_distance_bias", True),
@@ -53,8 +54,11 @@ class ContextualFGKGCL2FWL(nn.Module):
             fg_pool=config.get("fg_pool", "sum"),
         )
         self.relation_encoder = PairRelationEncoder(self.pair_relation_size)
+        self.null_pair_fg_either = nn.Parameter(torch.zeros(self.fg_hidden_size))
+        self.null_pair_fg_shared = nn.Parameter(torch.zeros(self.fg_hidden_size))
+        self.fg_pair_pool_project = nn.Linear(self.fg_hidden_size, self.hidden_size)
         self.pair_fg_context = nn.Sequential(
-            nn.Linear(self.hidden_size * 3, self.hidden_size),
+            nn.Linear(self.hidden_size * 5, self.hidden_size),
             nn.SELU(),
             nn.Linear(self.hidden_size, self.hidden_size),
         )
@@ -88,7 +92,7 @@ class ContextualFGKGCL2FWL(nn.Module):
         self.proposal_head = CandidateProposalHead(
             self.hidden_size,
             self.pair_relation_size,
-            self.hidden_size * 2,
+            self.hidden_size * 5,
         )
 
         self.atom_linear = nn.Sequential(
@@ -123,6 +127,9 @@ class ContextualFGKGCL2FWL(nn.Module):
         atom_fg_context: torch.Tensor,
         pair_rel: torch.Tensor,
         pairs: torch.Tensor,
+        fg_out=None,
+        fg_metadata=None,
+        atom_scope=None,
     ) -> torch.Tensor:
         if pairs.numel() == 0:
             return torch.zeros((0, self.pair_hidden_size), dtype=atom_states.dtype, device=atom_states.device)
@@ -131,7 +138,13 @@ class ContextualFGKGCL2FWL(nn.Module):
         left_fg = atom_fg_context[pairs[:, 0]]
         right_fg = atom_fg_context[pairs[:, 1]]
         omega_fg = self.pair_fg_context(
-            torch.cat([left_fg + right_fg, torch.abs(left_fg - right_fg), left_fg * right_fg], dim=1)
+            self._fg_pair_context(
+                atom_fg_context,
+                pairs,
+                fg_out=fg_out,
+                fg_metadata=fg_metadata,
+                atom_scope=atom_scope,
+            )
         )
         diag = (pairs[:, 0] == pairs[:, 1]).to(dtype=atom_states.dtype, device=atom_states.device).unsqueeze(1)
         return self.pair_init(torch.cat([left, right, pair_rel, left_fg, right_fg, omega_fg, diag], dim=1))
@@ -179,7 +192,13 @@ class ContextualFGKGCL2FWL(nn.Module):
 
         enc_pair_rel = self.relation_encoder(sparse.pair_relation_features)
         enc_pair_states = self._init_pair_states(
-            atom_states, atom_fg_context, enc_pair_rel, sparse.enc_carrier_pairs
+            atom_states,
+            atom_fg_context,
+            enc_pair_rel,
+            sparse.enc_carrier_pairs,
+            fg_out=fg_out,
+            fg_metadata=graph_batch.fg_metadata,
+            atom_scope=sparse.atom_scope,
         )
         depth = max(1, int(self.config.get("depth", 1)))
         for layer_idx in range(depth):
@@ -215,9 +234,20 @@ class ContextualFGKGCL2FWL(nn.Module):
         enc_pair_states: torch.Tensor,
         dec_pairs: torch.Tensor,
         dec_pair_rel: torch.Tensor,
+        fg_out=None,
+        fg_metadata=None,
+        atom_scope=None,
     ) -> torch.Tensor:
         enc_lookup = {tuple(pair): idx for idx, pair in enumerate(enc_pairs.tolist())}
-        initialized = self._init_pair_states(atom_states, atom_fg_context, dec_pair_rel, dec_pairs)
+        initialized = self._init_pair_states(
+            atom_states,
+            atom_fg_context,
+            dec_pair_rel,
+            dec_pairs,
+            fg_out=fg_out,
+            fg_metadata=fg_metadata,
+            atom_scope=atom_scope,
+        )
         if dec_pairs.numel() == 0:
             return initialized
         rows = []
@@ -229,12 +259,114 @@ class ContextualFGKGCL2FWL(nn.Module):
                 rows.append(self.reuse_pair(enc_pair_states[enc_idx]))
         return torch.stack(rows, dim=0)
 
-    def _fg_pair_context(self, atom_fg_context: torch.Tensor, unordered_pairs: torch.Tensor) -> torch.Tensor:
+    def _pool_pair_fg_rows(
+        self,
+        fg_embeddings: torch.Tensor,
+        row_indices: list[int],
+        null_value: torch.Tensor,
+    ) -> torch.Tensor:
+        if not row_indices:
+            pooled = null_value.to(device=fg_embeddings.device, dtype=fg_embeddings.dtype)
+        else:
+            selected = fg_embeddings[torch.tensor(row_indices, dtype=torch.long, device=fg_embeddings.device)]
+            if self.fg_encoder.fg_pool == "mean":
+                pooled = selected.mean(dim=0)
+            elif self.fg_encoder.fg_pool == "max":
+                pooled = selected.max(dim=0).values
+            else:
+                pooled = selected.sum(dim=0)
+        return self.fg_pair_pool_project(pooled)
+
+    def _pair_fg_instance_pools(
+        self,
+        unordered_pairs: torch.Tensor,
+        fg_out=None,
+        fg_metadata=None,
+        atom_scope=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if unordered_pairs.numel() == 0:
-            return torch.zeros((0, self.hidden_size * 2), dtype=atom_fg_context.dtype, device=atom_fg_context.device)
+            device = unordered_pairs.device
+            dtype = self.null_pair_fg_either.dtype
+            return (
+                torch.zeros((0, self.hidden_size), dtype=dtype, device=device),
+                torch.zeros((0, self.hidden_size), dtype=dtype, device=device),
+            )
+        if fg_out is None or fg_metadata is None or atom_scope is None:
+            either_null = self.fg_pair_pool_project(self.null_pair_fg_either).to(device=unordered_pairs.device)
+            shared_null = self.fg_pair_pool_project(self.null_pair_fg_shared).to(device=unordered_pairs.device)
+            return (
+                either_null.unsqueeze(0).expand(unordered_pairs.size(0), -1),
+                shared_null.unsqueeze(0).expand(unordered_pairs.size(0), -1),
+            )
+
+        fg_embeddings = fg_out.fg_embeddings
+        either_pools = []
+        shared_pools = []
+        scopes = list(atom_scope)
+        for i_abs, j_abs in unordered_pairs.detach().cpu().tolist():
+            mol_idx = None
+            for scope_idx, (atom_start, atom_count) in enumerate(scopes):
+                atom_end = atom_start + atom_count
+                if atom_start <= int(i_abs) < atom_end and atom_start <= int(j_abs) < atom_end:
+                    mol_idx = scope_idx
+                    break
+            if mol_idx is None or mol_idx >= len(fg_metadata):
+                either_pools.append(self._pool_pair_fg_rows(fg_embeddings, [], self.null_pair_fg_either))
+                shared_pools.append(self._pool_pair_fg_rows(fg_embeddings, [], self.null_pair_fg_shared))
+                continue
+
+            atom_start, atom_count = scopes[mol_idx]
+            metadata = fg_metadata[mol_idx]
+            i_local = int(i_abs) - atom_start
+            j_local = int(j_abs) - atom_start
+            if i_local < 0 or j_local < 0 or i_local >= atom_count or j_local >= atom_count:
+                either_pools.append(self._pool_pair_fg_rows(fg_embeddings, [], self.null_pair_fg_either))
+                shared_pools.append(self._pool_pair_fg_rows(fg_embeddings, [], self.null_pair_fg_shared))
+                continue
+
+            i_context = set(metadata.atom_to_fg_context[i_local]) if i_local < len(metadata.atom_to_fg_context) else set()
+            j_context = set(metadata.atom_to_fg_context[j_local]) if j_local < len(metadata.atom_to_fg_context) else set()
+            if mol_idx >= len(fg_out.fg_instance_scope):
+                either_pools.append(self._pool_pair_fg_rows(fg_embeddings, [], self.null_pair_fg_either))
+                shared_pools.append(self._pool_pair_fg_rows(fg_embeddings, [], self.null_pair_fg_shared))
+                continue
+            fg_start, fg_count = fg_out.fg_instance_scope[mol_idx]
+            either_rows = [
+                fg_start + fg_idx
+                for fg_idx in sorted(i_context | j_context)
+                if 0 <= fg_idx < fg_count
+            ]
+            shared_rows = [
+                fg_start + fg_idx
+                for fg_idx in sorted(i_context & j_context)
+                if 0 <= fg_idx < fg_count
+            ]
+            either_pools.append(self._pool_pair_fg_rows(fg_embeddings, either_rows, self.null_pair_fg_either))
+            shared_pools.append(self._pool_pair_fg_rows(fg_embeddings, shared_rows, self.null_pair_fg_shared))
+
+        return torch.stack(either_pools, dim=0), torch.stack(shared_pools, dim=0)
+
+    def _fg_pair_context(
+        self,
+        atom_fg_context: torch.Tensor,
+        unordered_pairs: torch.Tensor,
+        fg_out=None,
+        fg_metadata=None,
+        atom_scope=None,
+    ) -> torch.Tensor:
+        if unordered_pairs.numel() == 0:
+            return torch.zeros((0, self.hidden_size * 5), dtype=atom_fg_context.dtype, device=atom_fg_context.device)
         left = atom_fg_context[unordered_pairs[:, 0]]
         right = atom_fg_context[unordered_pairs[:, 1]]
-        return torch.cat([left + right, torch.abs(left - right)], dim=1)
+        either_pool, shared_pool = self._pair_fg_instance_pools(
+            unordered_pairs,
+            fg_out=fg_out,
+            fg_metadata=fg_metadata,
+            atom_scope=atom_scope,
+        )
+        either_pool = either_pool.to(dtype=atom_fg_context.dtype, device=atom_fg_context.device)
+        shared_pool = shared_pool.to(dtype=atom_fg_context.dtype, device=atom_fg_context.device)
+        return torch.cat([left + right, torch.abs(left - right), left * right, either_pool, shared_pool], dim=1)
 
     def _gold_bond_pairs(self, targets: list[ContextualEditTarget] | None) -> set[tuple[int, int]]:
         if not targets:
@@ -405,7 +537,13 @@ class ContextualFGKGCL2FWL(nn.Module):
         use_proposal = bool(self.config.get("pair_use_proposal", True))
         if use_proposal:
             proposal_pair_rel = self.relation_encoder(sparse.proposal_pair_relation_features)
-            proposal_fg_context = self._fg_pair_context(atom_fg_context, sparse.proposal_universe_pairs)
+            proposal_fg_context = self._fg_pair_context(
+                atom_fg_context,
+                sparse.proposal_universe_pairs,
+                fg_out=fg_out,
+                fg_metadata=graph_batch.fg_metadata,
+                atom_scope=sparse.atom_scope,
+            )
             proposal_logits = self.proposal_head(
                 atom_states,
                 sparse.proposal_universe_pairs,
@@ -432,6 +570,9 @@ class ContextualFGKGCL2FWL(nn.Module):
             enc_pair_states,
             sparse.dec_carrier_pairs_base,
             dec_pair_rel,
+            fg_out=fg_out,
+            fg_metadata=graph_batch.fg_metadata,
+            atom_scope=sparse.atom_scope,
         )
         dec_pair_states = self.decoder(
             dec_pair_states,
@@ -465,6 +606,7 @@ class ContextualFGKGCL2FWL(nn.Module):
             "proposal_logits": proposal_logits.detach(),
             "proposal_bce": float(self.last_proposal_loss.detach().cpu().item()),
             "proposal_enabled": use_proposal,
+            "pair_fg_context_mode": "endpoint_atom_context_plus_pooled_fg_instance_context",
             "encoder_pair_layer_mode": (
                 "shared_final"
                 if self.encoder_pair_layers and len(self.encoder_pair_layers) < int(self.config.get("depth", 1))

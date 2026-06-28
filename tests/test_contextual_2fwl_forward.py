@@ -3,10 +3,12 @@ import pytest
 Chem = pytest.importorskip("rdkit.Chem")
 torch = pytest.importorskip("torch")
 
+from kgcl_retro.chemistry.contextual_fg import FunctionalGroupInstance, MoleculeFGMetadata
 from kgcl_retro.chemistry.features import ATOM_FDIM, BOND_FDIM
 from kgcl_retro.chemistry.graphs import MolGraph, Vocab
 from kgcl_retro.data.collate import get_batch_graphs, prepare_contextual_edit_labels
 from kgcl_retro.models import KGCL
+from kgcl_retro.models.contextual_fg import ContextualFGOutput
 
 
 def test_contextual_2fwl_forward_tiny_molecule():
@@ -168,3 +170,79 @@ def test_contextual_edge_gru_uses_previous_edge_state_as_hidden():
 
     edge_initial = model.contextual_2fwl.edge_input(graph_batch.base_tensors[1])
     assert torch.allclose(recorder.calls[0][1], edge_initial)
+
+
+def test_pair_fg_context_pools_either_and_shared_fg_instances():
+    atom_vocab = Vocab([("Change Atom", (0, 0))])
+    bond_vocab = Vocab([("Add Bond", (1.0, None))])
+    config = {
+        "model_variant": "contextual_2fwl",
+        "n_atom_feat": ATOM_FDIM,
+        "n_bond_feat": ATOM_FDIM + BOND_FDIM,
+        "mpn_size": 4,
+        "mlp_size": 8,
+        "depth": 1,
+        "dropout_mlp": 0.0,
+        "dropout_mpn": 0.0,
+        "atom_message": False,
+        "use_attn": False,
+        "n_heads": 1,
+        "fg_hidden_size": 4,
+        "pair_hidden_size": 4,
+        "pair_relation_size": 4,
+        "pair_enc_layers": 1,
+        "pair_dec_layers": 1,
+        "pair_topk": 8,
+    }
+    model = KGCL(config=config, atom_vocab=atom_vocab, bond_vocab=bond_vocab).contextual_2fwl
+    with torch.no_grad():
+        model.fg_pair_pool_project.weight.copy_(torch.eye(4))
+        model.fg_pair_pool_project.bias.zero_()
+        model.null_pair_fg_either.copy_(torch.tensor([-1.0, -1.0, -1.0, -1.0]))
+        model.null_pair_fg_shared.copy_(torch.tensor([-2.0, -2.0, -2.0, -2.0]))
+
+    metadata = MoleculeFGMetadata(
+        instances=[
+            FunctionalGroupInstance("fg0", 0, (0,), (0,), {}, (), (), None, None),
+            FunctionalGroupInstance("fg1", 1, (1,), (0, 1), {}, (), (), None, None),
+            FunctionalGroupInstance("fg2", 2, (2,), (1,), {}, (), (), None, None),
+        ],
+        atom_to_fg_core=[[], [], []],
+        atom_to_fg_context=[[0, 1], [1, 2], []],
+        atom_fg_distance=[[], [], []],
+        has_null=False,
+        num_atoms=3,
+    )
+    fg_out = ContextualFGOutput(
+        fg_embeddings=torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0, 0.0],
+                [0.0, 0.0, 3.0, 0.0],
+            ]
+        ),
+        atom_fg_context=torch.zeros((4, 4)),
+        enhanced_atom_states=torch.zeros((4, 4)),
+        fg_instance_scope=[(0, 3)],
+        diagnostics={},
+    )
+    atom_fg_context = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [3.0, 3.0, 3.0, 3.0],
+            [5.0, 5.0, 5.0, 5.0],
+        ]
+    )
+    pair_features = model._fg_pair_context(
+        atom_fg_context,
+        torch.tensor([[1, 2], [1, 3]], dtype=torch.long),
+        fg_out=fg_out,
+        fg_metadata=[metadata],
+        atom_scope=[(1, 3)],
+    )
+
+    assert torch.allclose(pair_features[0, 12:16], torch.tensor([1.0, 2.0, 3.0, 0.0]))
+    assert torch.allclose(pair_features[0, 16:20], torch.tensor([0.0, 2.0, 0.0, 0.0]))
+    assert torch.allclose(pair_features[1, 12:16], torch.tensor([1.0, 2.0, 0.0, 0.0]))
+    assert torch.allclose(pair_features[1, 16:20], torch.tensor([-2.0, -2.0, -2.0, -2.0]))
