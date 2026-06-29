@@ -205,8 +205,10 @@ def _relation_tensors(
     fg_metadata: MoleculeFGMetadata,
     pairs: torch.LongTensor,
     atom_offset: int,
+    distances: list[list[int]] | None = None,
 ) -> tuple[torch.LongTensor, torch.FloatTensor]:
-    distances = _distances(mol)
+    if distances is None:
+        distances = _distances(mol)
     fg_contexts = _fg_context_sets(fg_metadata, atom_offset)
     codes = []
     features = []
@@ -222,9 +224,11 @@ def _score_pairs(
     atom_offset: int,
     pair_near_radius: int,
     max_score_pairs: int,
+    distances: list[list[int]] | None = None,
 ) -> set[tuple[int, int]]:
     n_atoms = mol.GetNumAtoms()
-    distances = _distances(mol)
+    if distances is None:
+        distances = _distances(mol)
     pairs = {(atom_offset + i, atom_offset + i) for i in range(n_atoms)}
     for bond in mol.GetBonds():
         i = atom_offset + bond.GetBeginAtomIdx()
@@ -286,8 +290,10 @@ def _bridge_atoms(
     pair_bridge_radius: int,
     max_bridges: int,
     proposal_pairs: set[tuple[int, int]] | None = None,
+    distances: list[list[int]] | None = None,
 ) -> list[int]:
-    distances = _distances(mol)
+    if distances is None:
+        distances = _distances(mol)
     i = i_abs - atom_offset
     j = j_abs - atom_offset
     bridge_atoms: set[int] = set()
@@ -323,11 +329,14 @@ def _carrier_pairs(
     max_carrier_pairs: int,
     max_bridges: int,
     proposal_pairs: set[tuple[int, int]] | None = None,
+    distances: list[list[int]] | None = None,
 ) -> set[tuple[int, int]]:
+    if distances is None:
+        distances = _distances(mol)
     carrier = set(score_pairs)
     for i, j in sorted(score_pairs):
         for u in _bridge_atoms(
-            mol, fg_metadata, i, j, atom_offset, pair_bridge_radius, max_bridges, proposal_pairs=proposal_pairs
+            mol, fg_metadata, i, j, atom_offset, pair_bridge_radius, max_bridges, proposal_pairs=proposal_pairs, distances=distances
         ):
             carrier.update({(i, u), (u, i), (u, j), (j, u)})
     return _cap_reversal_closed(carrier, max_carrier_pairs, score_pairs)
@@ -343,7 +352,10 @@ def _bridge_tensors(
     proposal_pairs: set[tuple[int, int]] | None = None,
     blocked_bridge_pairs: set[tuple[int, int]] | None = None,
     protected_pairs: set[tuple[int, int]] | None = None,
+    distances: list[list[int]] | None = None,
 ) -> tuple[torch.LongTensor, torch.BoolTensor]:
+    if distances is None:
+        distances = _distances(mol)
     rows: list[list[int]] = []
     masks: list[list[bool]] = []
     carrier = set(carrier_pairs)
@@ -359,6 +371,7 @@ def _bridge_tensors(
             pair_bridge_radius,
             max_bridges * 2,
             proposal_pairs=proposal_pairs,
+            distances=distances,
         )
         closed = []
         for u in candidates:
@@ -394,16 +407,19 @@ def build_encoder_pair_metadata(
     pair_max_score_pairs_enc: int = 512,
     pair_max_carrier_pairs_enc: int = 1024,
     pair_max_bridges_enc: int = 8,
+    distances: list[list[int]] | None = None,
 ) -> SparsePairMetadata:
-    enc_score = _score_pairs(mol, fg_metadata, atom_offset, pair_near_radius, pair_max_score_pairs_enc)
+    if distances is None:
+        distances = _distances(mol)
+    enc_score = _score_pairs(mol, fg_metadata, atom_offset, pair_near_radius, pair_max_score_pairs_enc, distances=distances)
     enc_carrier = _carrier_pairs(
-        mol, fg_metadata, enc_score, atom_offset, pair_bridge_radius, pair_max_carrier_pairs_enc, pair_max_bridges_enc
+        mol, fg_metadata, enc_score, atom_offset, pair_bridge_radius, pair_max_carrier_pairs_enc, pair_max_bridges_enc, distances=distances
     )
     enc_bridge_index, enc_bridge_mask = _bridge_tensors(
-        mol, fg_metadata, enc_carrier, atom_offset, pair_bridge_radius, pair_max_bridges_enc
+        mol, fg_metadata, enc_carrier, atom_offset, pair_bridge_radius, pair_max_bridges_enc, distances=distances
     )
     enc_carrier_tensor = _to_tensor(enc_carrier)
-    relation_codes, relation_features = _relation_tensors(mol, fg_metadata, enc_carrier_tensor, atom_offset)
+    relation_codes, relation_features = _relation_tensors(mol, fg_metadata, enc_carrier_tensor, atom_offset, distances=distances)
     empty_pairs = torch.zeros((0, 2), dtype=torch.long)
     empty_bridge = torch.zeros((0, pair_max_bridges_enc), dtype=torch.long)
     empty_mask = torch.zeros((0, pair_max_bridges_enc), dtype=torch.bool)
@@ -441,9 +457,11 @@ def build_proposal_universe(
     pair_near_radius: int = 2,
     pair_max_pairs: int = 2048,
     tiny_mol_all_pairs_cutoff: int = 16,
+    distances: list[list[int]] | None = None,
 ) -> ProposalPairMetadata:
     n_atoms = mol.GetNumAtoms()
-    distances = _distances(mol)
+    if distances is None:
+        distances = _distances(mol)
     unordered: set[tuple[int, int]] = set()
     for bond in mol.GetBonds():
         unordered.add(tuple(sorted((atom_offset + bond.GetBeginAtomIdx(), atom_offset + bond.GetEndAtomIdx()))))
@@ -460,7 +478,7 @@ def build_proposal_universe(
                 unordered.add((atom_offset + i, atom_offset + j))
     ordered = sorted(unordered)[:pair_max_pairs]
     pair_tensor = _to_tensor(ordered)
-    relation_codes, relation_features = _relation_tensors(mol, fg_metadata, pair_tensor, atom_offset)
+    relation_codes, relation_features = _relation_tensors(mol, fg_metadata, pair_tensor, atom_offset, distances=distances)
     return ProposalPairMetadata(
         unordered_pairs=pair_tensor,
         pair_relation_features=relation_features,
@@ -483,8 +501,11 @@ def build_decoder_pair_metadata(
     pair_max_score_pairs_dec: int = 1024,
     pair_max_carrier_pairs_dec: int = 2048,
     pair_max_bridges_dec: int = 8,
+    distances: list[list[int]] | None = None,
 ) -> SparsePairMetadata:
     del pair_near_radius
+    if distances is None:
+        distances = _distances(mol)
     enc_score = set(enc_score_pairs)
     proposal_unordered = _normalize_unordered_pairs(proposal_topk_pairs)
     proposal_directed = _with_reversals(proposal_unordered)
@@ -509,6 +530,7 @@ def build_decoder_pair_metadata(
         pair_max_carrier_pairs_dec,
         pair_max_bridges_dec,
         proposal_pairs=proposal_unordered,
+        distances=distances,
     )
     gold_rescued_directed = _with_reversals(rescued)
     bridge_index, bridge_mask = _bridge_tensors(
@@ -521,9 +543,10 @@ def build_decoder_pair_metadata(
         proposal_pairs=proposal_unordered,
         blocked_bridge_pairs=gold_rescued_directed,
         protected_pairs=gold_rescued_directed,
+        distances=distances,
     )
     carrier_tensor = _to_tensor(carrier)
-    relation_codes, relation_features = _relation_tensors(mol, fg_metadata, carrier_tensor, atom_offset)
+    relation_codes, relation_features = _relation_tensors(mol, fg_metadata, carrier_tensor, atom_offset, distances=distances)
     action_pairs = _unordered_candidates(score_pairs)
     absent_in_inference = gold_unordered - inference_candidates
     diagnostics = {
@@ -571,6 +594,7 @@ def build_sparse_pair_metadata(
     pair_max_bridges_dec: int = 8,
     pair_topk: int = 64,
 ) -> SparsePairMetadata:
+    distances = _distances(mol)
     encoder = build_encoder_pair_metadata(
         mol,
         fg_metadata,
@@ -580,6 +604,7 @@ def build_sparse_pair_metadata(
         pair_max_score_pairs_enc=pair_max_score_pairs_enc,
         pair_max_carrier_pairs_enc=pair_max_carrier_pairs_enc,
         pair_max_bridges_enc=pair_max_bridges_enc,
+        distances=distances,
     )
     proposal = build_proposal_universe(
         mol,
@@ -587,6 +612,7 @@ def build_sparse_pair_metadata(
         atom_offset=atom_offset,
         pair_near_radius=pair_near_radius,
         pair_max_pairs=max(pair_topk, pair_max_score_pairs_dec),
+        distances=distances,
     )
     decoder = build_decoder_pair_metadata(
         mol,
@@ -599,6 +625,7 @@ def build_sparse_pair_metadata(
         pair_max_carrier_pairs_dec=pair_max_carrier_pairs_dec,
         pair_max_bridges_dec=pair_max_bridges_dec,
         training=False,
+        distances=distances,
     )
     encoder.dec_score_pairs_base = decoder.dec_score_pairs_base
     encoder.dec_carrier_pairs_base = decoder.dec_carrier_pairs_base
