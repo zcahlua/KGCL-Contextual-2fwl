@@ -52,6 +52,23 @@ python train.py --dataset uspto_50k --model_variant contextual_2fwl
 python eval.py --dataset uspto_50k --model_variant contextual_2fwl
 ```
 
+Quick example: if you want to change from the baseline KGCL model to the contextual FG + sparse 2-FWL model, add `--model_variant contextual_2fwl` to the terminal command:
+
+```bash
+# 1. Build contextual training data. Do this for train, valid, and test.
+python prepare_data.py --dataset uspto_50k --mode train --model_variant contextual_2fwl
+python prepare_data.py --dataset uspto_50k --mode valid --model_variant contextual_2fwl
+python prepare_data.py --dataset uspto_50k --mode test --model_variant contextual_2fwl
+
+# 2. Train the contextual model.
+python train.py --dataset uspto_50k --model_variant contextual_2fwl
+
+# 3. Evaluate with the same model variant.
+python eval.py --dataset uspto_50k --model_variant contextual_2fwl
+```
+
+`contextual_2fwl` is the recommended name to type. `contextual_fg_2fwl` and `contextual-fg-kgcl-2fwl` are accepted aliases for the same model. FG means functional group.
+
 This variant adds matched functional-group instance metadata, local contextual FG graph encoding, pre-D-MPNN atom-FG attention, sparse bridge-closed ordered pair states, proposal top-K decoder expansion, dynamic gold-action target mapping, proposal BCE, candidate-restricted atom/bond/stop action vectors, and candidate-pair diagnostics. Prepared data for this mode is not compatible with old baseline shards; rerun `prepare_data.py` with `--model_variant contextual_2fwl`.
 
 The pair module is sparse, local, bridge-closed, and task-restricted. It is 2-FWL-inspired, but it is not full dense 2-FWL over all `V x V` atom pairs.
