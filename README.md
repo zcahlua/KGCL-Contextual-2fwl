@@ -129,6 +129,7 @@ kgcl-eval-roundtrip --dataset uspto_50k
 | `--beam_size 50`                  |  USPTO-50K eval | eval               | Produces candidates for top-k exact-match and MaxFrag at k=1,3,5,10,50. |
 | `--beam_size 10`                  | USPTO-FULL eval | eval               | Produces candidates for top-k exact-match at k=1,3,5,10.                |
 | `--experiments BEST`              |            BEST | eval               | Selects the experiment/checkpoint directory.                            |
+| `--checkpoint epoch_*.pt`         | dataset-specific | eval              | Selects the checkpoint file inside the experiment directory.             |
 | `--root_dir .`                    |    current repo | package CLI        | Root containing `data/` and `experiments/`.                             |
 
 ## Common recipes
