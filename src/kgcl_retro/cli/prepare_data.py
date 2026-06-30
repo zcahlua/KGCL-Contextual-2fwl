@@ -161,9 +161,12 @@ def prepare_data(args: Any) -> None:  # Explanation: defines prepare_data, which
     print(f"All {args.mode} reactions complete.")  # Explanation: prints progress or diagnostic information
     sys.stdout.flush()  # Explanation: executes this statement as part of prepare graph-edit training tensors
 
-    batch_tensors = process_batch(batch_graphs, args)  # Explanation: assigns an intermediate value used by later computation
-    print("Saving..")  # Explanation: prints progress or diagnostic information
-    torch.save(batch_tensors, os.path.join(savedir, f'batch-{batch_num}.pt'))  # Explanation: saves tensor batches or checkpoints
+    if batch_graphs:
+        batch_tensors = process_batch(batch_graphs, args)  # Explanation: assigns an intermediate value used by later computation
+        print("Saving..")  # Explanation: prints progress or diagnostic information
+        torch.save(batch_tensors, os.path.join(savedir, f'batch-{batch_num}.pt'))  # Explanation: saves tensor batches or checkpoints
+    elif batch_num == 0:
+        print("No valid reactions to save.")  # Explanation: reports empty output instead of building an empty batch.
 
 
 def main():  # Explanation: defines main, which runs this script from command-line arguments
