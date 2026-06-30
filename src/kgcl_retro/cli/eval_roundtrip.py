@@ -59,6 +59,8 @@ def main():  # Explanation: defines main, which runs this script from command-li
                         action='store_true', help='Whether to use rxn_class')  # Explanation: assigns an intermediate value used by later computation
     parser.add_argument('--experiments', type=str, default='BEST',  # Explanation: selects experiment checkpoint directory
                         help='Name of edits prediction experiment')  # Explanation: assigns an intermediate value used by later computation
+    parser.add_argument('--checkpoint', type=str, default=None,  # Explanation: selects a checkpoint file within the experiment directory.
+                        help='Checkpoint filename inside the selected experiment directory')  # Explanation: documents checkpoint selection.
     parser.add_argument('--beam_size', type=int, default=50, help='Beam search width')  # Explanation: sets evaluation beam width
     parser.add_argument('--max_steps', type=int, default=9, help='maximum number of edit steps')  # Explanation: limits graph edit sequence length
     parser.add_argument('--root_dir', type=str, default=DEFAULT_ROOT_DIR,  # Explanation: selects the root directory containing data and experiments.
@@ -77,7 +79,8 @@ def main():  # Explanation: defines main, which runs this script from command-li
     else:  # Explanation: handles the fallback branch for the preceding condition
         exp_dir = os.path.join(str(paths.experiments_dir), f'{args.dataset}', 'without_rxn_class', f'{args.experiments}')  # Explanation: builds a filesystem path
 
-    checkpoint = torch.load(os.path.join(exp_dir, 'epoch_132.pt'))  # Explanation: loads saved tensor batches or checkpoints
+    checkpoint_name = args.checkpoint or 'epoch_132.pt'
+    checkpoint = torch.load(os.path.join(exp_dir, checkpoint_name))  # Explanation: loads saved tensor batches or checkpoints
     config = checkpoint['saveables']  # Explanation: assigns an intermediate value used by later computation
 
     model = KGCL(**config, device=DEVICE)  # Explanation: assigns an intermediate value used by later computation
@@ -87,6 +90,7 @@ def main():  # Explanation: defines main, which runs this script from command-li
 
     top_k = np.zeros(args.beam_size)  # Explanation: assigns an intermediate value used by later computation
     rt_top_k = np.zeros(args.beam_size)  # Explanation: assigns an intermediate value used by later computation
+    report_top_ks = [k for k in [1, 3, 5, 10, 50] if k <= args.beam_size]
     beam_model = BeamSearch(model=model, step_beam_size=10, beam_size=args.beam_size, use_rxn_class=args.use_rxn_class)  # Explanation: assigns an intermediate value used by later computation
     p_bar = tqdm(list(range(len(test_data))))  # Explanation: assigns an intermediate value used by later computation
 
@@ -96,6 +100,8 @@ def main():  # Explanation: defines main, which runs this script from command-li
         targets = [''.join(line.strip().split(' ')) for line in f.readlines()]  # Explanation: assigns an intermediate value used by later computation
 
     current_target_idx = 0  # Explanation: assigns an intermediate value used by later computation
+    pred_text_dir = os.path.join(exp_dir, 'pred_text1')
+    os.makedirs(pred_text_dir, exist_ok=True)
 
     for idx in p_bar:  # Explanation: iterates over this collection to process each item
         rxn_data = test_data[idx]  # Explanation: computes an intermediate value for molecular graph editing
@@ -109,7 +115,7 @@ def main():  # Explanation: defines main, which runs this script from command-li
         r_smi = Chem.MolToSmiles(r_mol)  # Explanation: serializes an RDKit molecule back to SMILES
         r_set = set(r_smi.split('.'))  # Explanation: assigns an intermediate value used by later computation
 
-        pred_text = os.path.join(exp_dir, 'pred_text1', f'{idx}.txt')  # Explanation: builds a filesystem path
+        pred_text = os.path.join(pred_text_dir, f'{idx}.txt')  # Explanation: builds a filesystem path
 
         with torch.no_grad():  # Explanation: opens a managed resource and closes it automatically
             top_k_results = beam_model.run_search(prod_smi=p, max_steps=args.max_steps, rxn_class=rxn_class)  # Explanation: assigns an intermediate value used by later computation
@@ -165,7 +171,7 @@ def main():  # Explanation: defines main, which runs this script from command-li
         current_target_idx = end_idx  # Explanation: assigns an intermediate value used by later computation
 
         msg = ''  # Explanation: assigns an intermediate value used by later computation
-        for beam_idx in [1, 3, 5, 10, 50]:  # Explanation: iterates over this collection to process each item
+        for beam_idx in report_top_ks:  # Explanation: iterates over this collection to process each item
             match_acc = np.sum(top_k[:beam_idx]) / (idx + 1)  # Explanation: assigns an intermediate value used by later computation
             Rt_acc = np.sum(rt_top_k[:beam_idx]) / (idx + 1)  # Explanation: assigns an intermediate value used by later computation
             msg += 'Exact accuracy, t%d: %.3f' % (beam_idx, match_acc)  # Explanation: assigns an intermediate value used by later computation
