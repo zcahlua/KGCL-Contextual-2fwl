@@ -24,6 +24,8 @@ def main():  # Explanation: defines main, which runs this script from command-li
                         action='store_true', help='Whether to use rxn_class')  # Explanation: assigns an intermediate value used by later computation
     parser.add_argument('--experiments', type=str, default='BEST',  # Explanation: selects experiment checkpoint directory
                         help='Name of edits prediction experiment')  # Explanation: assigns an intermediate value used by later computation
+    parser.add_argument('--checkpoint', type=str, default=None,  # Explanation: selects a checkpoint file within the experiment directory.
+                        help='Checkpoint filename inside the selected experiment directory')  # Explanation: documents checkpoint selection.
     parser.add_argument('--beam_size', type=int,  # Explanation: sets evaluation beam width
                         default=10, help='Beam search width')  # Explanation: assigns an intermediate value used by later computation
     parser.add_argument('--max_steps', type=int, default=9,  # Explanation: limits graph edit sequence length
@@ -46,7 +48,8 @@ def main():  # Explanation: defines main, which runs this script from command-li
         exp_dir = os.path.join(  # Explanation: builds a filesystem path
             str(paths.experiments_dir), f'{args.dataset}', 'without_rxn_class', f'{args.experiments}')  # Explanation: executes this statement as part of evaluate USPTO-FULL exact-match accuracy
 
-    checkpoint = torch.load(os.path.join(exp_dir, 'epoch_168.pt'))  # Explanation: loads saved tensor batches or checkpoints
+    checkpoint_name = args.checkpoint or 'epoch_168.pt'
+    checkpoint = torch.load(os.path.join(exp_dir, checkpoint_name))  # Explanation: loads saved tensor batches or checkpoints
     config = checkpoint['saveables']  # Explanation: assigns an intermediate value used by later computation
 
     model = KGCL(**config, device=DEVICE)  # Explanation: assigns an intermediate value used by later computation
@@ -55,6 +58,7 @@ def main():  # Explanation: defines main, which runs this script from command-li
     model.eval()  # Explanation: executes this statement as part of evaluate USPTO-FULL exact-match accuracy
 
     top_k = np.zeros(args.beam_size)  # Explanation: assigns an intermediate value used by later computation
+    report_top_ks = [k for k in [1, 3, 5, 10] if k <= args.beam_size]
     edit_steps_cor = []  # Explanation: computes an intermediate value for molecular graph editing
     counter = []  # Explanation: assigns an intermediate value used by later computation
     stereo_rxn = []  # Explanation: assigns an intermediate value used by later computation
@@ -114,7 +118,7 @@ def main():  # Explanation: defines main, which runs this script from command-li
                         stereo_rxn_cor.append(idx)  # Explanation: executes this statement as part of evaluate USPTO-FULL exact-match accuracy
 
             msg = 'average score'  # Explanation: assigns an intermediate value used by later computation
-            for beam_idx in [1, 3, 5, 10]:  # Explanation: iterates over this collection to process each item
+            for beam_idx in report_top_ks:  # Explanation: iterates over this collection to process each item
                 match_acc = np.sum(top_k[:beam_idx]) / (idx + 1)  # Explanation: assigns an intermediate value used by later computation
                 msg += ', t%d: %.3f' % (beam_idx, match_acc)  # Explanation: assigns an intermediate value used by later computation
             p_bar.set_description(msg)  # Explanation: executes this statement as part of evaluate USPTO-FULL exact-match accuracy
