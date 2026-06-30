@@ -1,0 +1,11 @@
+joblib
+numpy
+pandas
+torch
+tqdm
+
+[chem]
+rdkit
+
+[dev]
+pytest

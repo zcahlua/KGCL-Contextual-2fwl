@@ -1,0 +1,8 @@
+[console_scripts]
+kgcl-canonicalize = kgcl_retro.cli.canonicalize_products:main
+kgcl-eval-50k = kgcl_retro.cli.eval_50k:main
+kgcl-eval-full = kgcl_retro.cli.eval_full:main
+kgcl-eval-roundtrip = kgcl_retro.cli.eval_roundtrip:main
+kgcl-prepare-data = kgcl_retro.cli.prepare_data:main
+kgcl-preprocess = kgcl_retro.cli.preprocess:main
+kgcl-train = kgcl_retro.cli.train:cli_main
