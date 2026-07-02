@@ -122,7 +122,12 @@ def test_pair_use_proposal_false_keeps_decoder_on_encoder_pairs():
     model([graph_batch])
 
     candidates = {tuple(pair) for pair in graph_batch.sparse_metadata.unordered_dec_candidate_pairs.tolist()}
-    assert (1, 3) not in candidates
+    encoder_candidates = {
+        tuple(sorted((int(i), int(j))))
+        for i, j in graph_batch.sparse_metadata.enc_score_pairs.tolist()
+        if int(i) != int(j)
+    }
+    assert candidates == encoder_candidates
     assert model.contextual_2fwl.last_proposal_loss is not None
     assert model.contextual_2fwl.last_proposal_loss.item() == 0.0
 

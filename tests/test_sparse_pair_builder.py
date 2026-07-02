@@ -1,11 +1,18 @@
+import inspect
+
 import pytest
 
 Chem = pytest.importorskip("rdkit.Chem")
 torch = pytest.importorskip("torch")
 
-from kgcl_retro.chemistry.contextual_fg import match_functional_group_instances
+from kgcl_retro.chemistry.contextual_fg import (
+    FunctionalGroupInstance,
+    MoleculeFGMetadata,
+    match_functional_group_instances,
+)
 from kgcl_retro.chemistry.sparse_pair_builder import (
     PAIR_RELATION_FEATURE_SIZE,
+    _score_pairs,
     build_decoder_pair_metadata,
     build_encoder_pair_metadata,
     build_proposal_universe,
@@ -15,6 +22,179 @@ from kgcl_retro.chemistry.sparse_pair_builder import (
 
 def _pairs(tensor):
     return {tuple(row) for row in tensor.tolist()}
+
+
+def _empty_fg_metadata(num_atoms):
+    return MoleculeFGMetadata(
+        instances=[],
+        atom_to_fg_core=[[] for _ in range(num_atoms)],
+        atom_to_fg_context=[[] for _ in range(num_atoms)],
+        atom_fg_distance=[[] for _ in range(num_atoms)],
+        has_null=False,
+        num_atoms=num_atoms,
+    )
+
+
+def _metadata_with_context(num_atoms, context_atoms):
+    context_atoms = tuple(context_atoms)
+    core_atom = context_atoms[0]
+    instance = FunctionalGroupInstance(
+        fg_name="test_fg",
+        fg_type_index=0,
+        core_atom_indices=(core_atom,),
+        context_atom_indices=context_atoms,
+        distance_to_core={atom_idx: 0 if atom_idx == core_atom else 1 for atom_idx in context_atoms},
+        core_mask=tuple(atom_idx == core_atom for atom_idx in context_atoms),
+        boundary_mask=tuple(atom_idx != core_atom for atom_idx in context_atoms),
+        kg_embedding=None,
+        chem_descriptors=[0.0] * 6,
+        is_null=False,
+    )
+    atom_to_fg_core = [[] for _ in range(num_atoms)]
+    atom_to_fg_core[core_atom].append(0)
+    atom_to_fg_context = [[] for _ in range(num_atoms)]
+    atom_fg_distance = [[] for _ in range(num_atoms)]
+    for atom_idx in context_atoms:
+        atom_to_fg_context[atom_idx].append(0)
+        atom_fg_distance[atom_idx].append(0 if atom_idx == core_atom else 1)
+    return MoleculeFGMetadata(
+        instances=[instance],
+        atom_to_fg_core=atom_to_fg_core,
+        atom_to_fg_context=atom_to_fg_context,
+        atom_fg_distance=atom_fg_distance,
+        has_null=False,
+        num_atoms=num_atoms,
+    )
+
+
+def test_score_pairs_includes_near_radius_pairs():
+    mol = Chem.MolFromSmiles("CCC")
+    fg_metadata = _empty_fg_metadata(mol.GetNumAtoms())
+
+    radius_two = _score_pairs(
+        mol,
+        fg_metadata,
+        atom_offset=1,
+        pair_near_radius=2,
+        max_score_pairs=128,
+    )
+    radius_one = _score_pairs(
+        mol,
+        fg_metadata,
+        atom_offset=1,
+        pair_near_radius=1,
+        max_score_pairs=128,
+    )
+
+    assert (1, 3) in radius_two
+    assert (3, 1) in radius_two
+    assert (1, 3) not in radius_one
+    assert (3, 1) not in radius_one
+
+
+def test_score_pairs_includes_fg_context_pairs():
+    mol = Chem.MolFromSmiles("CCCC")
+    fg_metadata = _metadata_with_context(mol.GetNumAtoms(), (0, 3))
+
+    pairs = _score_pairs(
+        mol,
+        fg_metadata,
+        atom_offset=1,
+        pair_near_radius=1,
+        max_score_pairs=128,
+    )
+
+    assert (1, 4) in pairs
+    assert (4, 1) in pairs
+
+
+def test_score_pairs_required_pairs_survive_cap():
+    mol = Chem.MolFromSmiles("CCC")
+    fg_metadata = _empty_fg_metadata(mol.GetNumAtoms())
+
+    pairs = _score_pairs(
+        mol,
+        fg_metadata,
+        atom_offset=1,
+        pair_near_radius=2,
+        max_score_pairs=1,
+    )
+
+    required = {(1, 1), (2, 2), (3, 3), (1, 2), (2, 1), (2, 3), (3, 2)}
+    assert required.issubset(pairs)
+
+
+def test_score_pairs_reversal_closed():
+    mol = Chem.MolFromSmiles("CCCC")
+    fg_metadata = _metadata_with_context(mol.GetNumAtoms(), (0, 3))
+
+    pairs = _score_pairs(
+        mol,
+        fg_metadata,
+        atom_offset=1,
+        pair_near_radius=2,
+        max_score_pairs=128,
+    )
+
+    for i, j in pairs:
+        if i != j:
+            assert (j, i) in pairs
+
+
+def test_encoder_metadata_relation_shapes():
+    mol = Chem.MolFromSmiles("CCC")
+    fg_metadata = match_functional_group_instances(mol, False, radius=1)
+
+    metadata = build_encoder_pair_metadata(
+        mol,
+        fg_metadata,
+        atom_offset=1,
+        pair_near_radius=2,
+        pair_bridge_radius=1,
+    )
+
+    assert metadata.enc_score_pairs.numel() > 0
+    assert _pairs(metadata.enc_score_pairs).issubset(_pairs(metadata.enc_carrier_pairs))
+    assert metadata.pair_relation_features.size(0) == metadata.enc_carrier_pairs.size(0)
+    for key in {
+        "num_enc_score_diag",
+        "num_enc_score_bond",
+        "num_enc_score_near",
+        "num_enc_score_fg",
+        "num_enc_score_uncapped",
+        "num_enc_score_capped",
+        "num_enc_score_dropped_by_cap",
+    }:
+        assert key in metadata.diagnostics
+
+
+def test_no_gold_leakage_in_encoder():
+    assert not any("gold" in name for name in inspect.signature(_score_pairs).parameters)
+    assert not any("gold" in name for name in inspect.signature(build_encoder_pair_metadata).parameters)
+
+    mol = Chem.MolFromSmiles("CCC")
+    fg_metadata = match_functional_group_instances(mol, False, radius=1)
+    metadata = build_encoder_pair_metadata(mol, fg_metadata, atom_offset=1)
+
+    assert metadata.gold_bond_pairs.numel() == 0
+    assert metadata.gold_atom_indices.numel() == 0
+
+
+def test_contextual_encoder_score_pairs_expand_beyond_diag_and_bonds():
+    mol = Chem.MolFromSmiles("CCC")
+    fg_metadata = match_functional_group_instances(mol, False, radius=1)
+
+    metadata = build_sparse_pair_metadata(
+        mol,
+        fg_metadata,
+        atom_offset=1,
+        pair_near_radius=2,
+        pair_bridge_radius=1,
+        build_decoder_base=False,
+    )
+
+    diag_and_bonds = mol.GetNumAtoms() + 2 * mol.GetNumBonds()
+    assert metadata.diagnostics["num_enc_score"] > diag_and_bonds
 
 
 def test_pair_sets_include_diagonals_and_reversals():
@@ -98,7 +278,7 @@ def test_proposal_topk_expands_decoder_candidates():
 
 def test_gold_pair_train_only_not_in_inference_candidates():
     mol = Chem.MolFromSmiles("CCO")
-    fg_metadata = match_functional_group_instances(mol, False, radius=1)
+    fg_metadata = _empty_fg_metadata(mol.GetNumAtoms())
     encoder = build_encoder_pair_metadata(
         mol,
         fg_metadata,
@@ -137,7 +317,7 @@ def test_gold_pair_train_only_not_in_inference_candidates():
 
 def test_training_gold_pair_survives_decoder_score_cap():
     mol = Chem.MolFromSmiles("CCO")
-    fg_metadata = match_functional_group_instances(mol, False, radius=1)
+    fg_metadata = _empty_fg_metadata(mol.GetNumAtoms())
     encoder = build_encoder_pair_metadata(
         mol,
         fg_metadata,
@@ -164,7 +344,7 @@ def test_training_gold_pair_survives_decoder_score_cap():
 
 def test_gold_only_pairs_do_not_bridge_unrelated_decoder_candidates():
     mol = Chem.MolFromSmiles("CCCC")
-    fg_metadata = match_functional_group_instances(mol, False, radius=1)
+    fg_metadata = _empty_fg_metadata(mol.GetNumAtoms())
     encoder = build_encoder_pair_metadata(
         mol,
         fg_metadata,

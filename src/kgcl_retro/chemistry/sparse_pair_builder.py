@@ -7,7 +7,7 @@ import time
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 from rdkit import Chem
@@ -262,6 +262,12 @@ def _fg_context_pairs_from_cache(cache: PairBuilderCache) -> set[tuple[int, int]
     return pairs
 
 
+def _pair_in_atom_scope(pair: tuple[int, int], atom_offset: int, num_atoms: int) -> bool:
+    start = atom_offset
+    end = atom_offset + num_atoms
+    return start <= pair[0] < end and start <= pair[1] < end
+
+
 def _ring_matrix(mol: Chem.Mol) -> list[list[bool]]:
     n_atoms = mol.GetNumAtoms()
     matrix = [[i == j for j in range(n_atoms)] for i in range(n_atoms)]
@@ -464,14 +470,127 @@ def _score_pairs(
     cache: PairBuilderCache | None = None,
 ) -> set[tuple[int, int]]:
     with _profile_block("_score_pairs"):
-        n_atoms = mol.GetNumAtoms()
-        pairs = {(atom_offset + i, atom_offset + i) for i in range(n_atoms)}
-        for bond in mol.GetBonds():
-            i = atom_offset + bond.GetBeginAtomIdx()
-            j = atom_offset + bond.GetEndAtomIdx()
-            pairs.add((i, j))
-            pairs.add((j, i))
-        return _cap_reversal_closed(pairs, max_score_pairs, _required_pairs(mol, atom_offset))
+        score_pairs, _ = _build_encoder_score_pairs(
+            mol,
+            fg_metadata,
+            atom_offset,
+            pair_near_radius,
+            max_score_pairs,
+            distances=distances,
+            cache=cache,
+        )
+        return score_pairs
+
+
+def _encoder_score_pair_sources(
+    mol: Chem.Mol,
+    fg_metadata: MoleculeFGMetadata,
+    atom_offset: int,
+    pair_near_radius: int,
+    distances: list[list[int]] | None = None,
+    cache: PairBuilderCache | None = None,
+) -> tuple[dict[str, set[tuple[int, int]]], set[tuple[int, int]], list[list[int]]]:
+    if cache is None:
+        cache = build_pair_builder_cache(mol, fg_metadata, atom_offset)
+    distances = cache.distances
+    n_atoms = cache.num_atoms
+
+    diag = {(atom_offset + i, atom_offset + i) for i in range(n_atoms)}
+    bond = {
+        pair
+        for pair in cache.bond_exists
+        if _pair_in_atom_scope(pair, atom_offset, n_atoms)
+    }
+
+    near: set[tuple[int, int]] = set()
+    for i in range(n_atoms):
+        i_abs = atom_offset + i
+        for j in range(n_atoms):
+            if i == j:
+                continue
+            distance = distances[i][j]
+            if distance != INF_DISTANCE and distance <= pair_near_radius:
+                j_abs = atom_offset + j
+                near.add((i_abs, j_abs))
+                near.add((j_abs, i_abs))
+
+    fg = {
+        (i, j)
+        for i, j in _fg_context_pairs_from_cache(cache)
+        if i != j and _pair_in_atom_scope((i, j), atom_offset, n_atoms)
+    }
+
+    sources = {
+        "diag": _with_reversals(diag),
+        "bond": _with_reversals(bond),
+        "near": _with_reversals(near),
+        "fg": _with_reversals(fg),
+    }
+    uncapped = _with_reversals(set().union(*sources.values()))
+    return sources, uncapped, distances
+
+
+def _encoder_score_pair_rank(
+    pair: tuple[int, int],
+    sources: dict[str, set[tuple[int, int]]],
+    distances: list[list[int]],
+    atom_offset: int,
+) -> tuple[int, int, int, tuple[int, int]]:
+    if pair in sources["diag"] or pair in sources["bond"]:
+        return (0, 0, 0, pair)
+    in_near = pair in sources["near"]
+    in_fg = pair in sources["fg"]
+    i = pair[0] - atom_offset
+    j = pair[1] - atom_offset
+    distance = distances[i][j] if 0 <= i < len(distances) and 0 <= j < len(distances[i]) else INF_DISTANCE
+    if in_near:
+        return (1, distance, 0 if in_fg else 1, pair)
+    if in_fg:
+        return (2, INF_DISTANCE, 0, pair)
+    return (3, INF_DISTANCE, 1, pair)
+
+
+def _encoder_score_diagnostics(
+    capped: set[tuple[int, int]],
+    sources: dict[str, set[tuple[int, int]]],
+    uncapped: set[tuple[int, int]],
+) -> dict[str, int]:
+    return {
+        "num_enc_score_diag": len(capped & sources["diag"]),
+        "num_enc_score_bond": len(capped & sources["bond"]),
+        "num_enc_score_near": len(capped & sources["near"]),
+        "num_enc_score_fg": len(capped & sources["fg"]),
+        "num_enc_score_uncapped": len(uncapped),
+        "num_enc_score_capped": len(capped),
+        "num_enc_score_dropped_by_cap": len(uncapped - capped),
+    }
+
+
+def _build_encoder_score_pairs(
+    mol: Chem.Mol,
+    fg_metadata: MoleculeFGMetadata,
+    atom_offset: int,
+    pair_near_radius: int,
+    max_score_pairs: int,
+    distances: list[list[int]] | None = None,
+    cache: PairBuilderCache | None = None,
+) -> tuple[set[tuple[int, int]], dict[str, int]]:
+    sources, uncapped, distances = _encoder_score_pair_sources(
+        mol,
+        fg_metadata,
+        atom_offset,
+        pair_near_radius,
+        distances=distances,
+        cache=cache,
+    )
+    required = sources["diag"] | sources["bond"]
+    capped = _cap_reversal_closed(
+        uncapped,
+        max_score_pairs,
+        required,
+        key_fn=lambda pair: _encoder_score_pair_rank(pair, sources, distances, atom_offset),
+    )
+    return capped, _encoder_score_diagnostics(capped, sources, uncapped)
 
 
 def _required_pairs(mol: Chem.Mol, atom_offset: int) -> set[tuple[int, int]]:
@@ -494,13 +613,15 @@ def _cap_reversal_closed(
     pairs: set[tuple[int, int]],
     max_pairs: int,
     required: set[tuple[int, int]],
+    key_fn: Callable[[tuple[int, int]], tuple] | None = None,
 ) -> set[tuple[int, int]]:
     pairs = _with_reversals(pairs)
     required = _with_reversals(required)
     if len(pairs) <= max_pairs:
         return pairs
     capped = set(required)
-    for pair in sorted(pairs - required):
+    optional = sorted(pairs - required) if key_fn is None else sorted(pairs - required, key=key_fn)
+    for pair in optional:
         reverse = (pair[1], pair[0])
         addition = {pair, reverse}
         if len(capped | addition) <= max_pairs:
@@ -672,8 +793,8 @@ def build_encoder_pair_metadata(
     with _profile_block("build_encoder_pair_metadata"):
         if cache is None:
             cache = build_pair_builder_cache(mol, fg_metadata, atom_offset)
-        distances = cache.distances if distances is None else distances
-        enc_score = _score_pairs(
+        distances = cache.distances
+        enc_score, enc_score_diagnostics = _build_encoder_score_pairs(
             mol,
             fg_metadata,
             atom_offset,
@@ -722,6 +843,7 @@ def build_encoder_pair_metadata(
             "num_enc_plus": len(enc_carrier),
             "avg_K_ij_enc": _avg_bridge_count(enc_bridge_mask),
             "fraction_enc_nonempty_bridge": float(enc_bridge_mask.any(dim=1).float().mean().item()) if enc_bridge_mask.numel() else 0.0,
+            **enc_score_diagnostics,
         }
         return SparsePairMetadata(
             enc_score_pairs=_to_tensor(enc_score),
